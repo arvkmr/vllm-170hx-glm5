@@ -269,6 +269,57 @@ export GLM52_DSA_FULLCG=${GLM52_DSA_FULLCG:-1}
 # it only matters when patch_dsa_fullwidth_capture.py is NOT applied.
 export GLM52_DSA_FULLCG_MAXLEN=${GLM52_DSA_FULLCG_MAXLEN:-0}
 
+# GLM52_TOPK_DET: decode-topk determinism mode (patch_topk_canon.py).
+# The stock topk kernels break exact score ties nondeterministically (fp8
+# indexer logits tie constantly); under MTP + PP pipelining the resulting
+# selection lottery cascades into temp-0 token flips at long context (the
+# 2026-08-13/14 copy-corruption investigation, NOTES_longctx_copy_fidelity.md).
+#   canon  (DEFAULT) canonical tie-break kernel: (score desc, index asc),
+#          ~0.24 ms worst-case per indexer layer call, capture-safe.
+#   torch  stable torch.topk overwrite (validation baseline, ~2x slower)
+#   ""     stock lottery behavior (debug only)
+# Validated 2026-08-14: 0/8 vs 3/8 corrupted generations on the 100K
+# overlap probe; quiet-repeat accept sequences bit-stable.
+export GLM52_TOPK_DET=${GLM52_TOPK_DET-canon}
+
+# GLM52_PREFILL_TOPK_DET: deterministic prefill topk selection
+# (patch_prefill_topk_canon.py + patch_prefill_topk_relfix.py). canon =
+# windowed canonical tie-break kernel, ~3.8ms per 2048x131072 call (~2%
+# of a 120K prefill). Keeps KV builds reproducible; validated in the
+# session-5 root-cause campaign. "" = stock lottery (debug only).
+export GLM52_PREFILL_TOPK_DET=${GLM52_PREFILL_TOPK_DET-canon}
+
+# GLM52_CAP_PREFILL_GUARD: the 08-15 mitigation (suspend decode splitting
+# during prefills). Root cause fixed 08-16 (PP topk relay,
+# patch_pp_topk_relay.py): 0/21 accuracy validated guard-OFF in both
+# eager and cudagraph modes, so the guard is retired from production.
+# Set 1 to re-arm if corruption is ever suspected again.
+export GLM52_CAP_PREFILL_GUARD=${GLM52_CAP_PREFILL_GUARD-0}
+
+# PP TOPK RELAY (patch_pp_topk_relay.py): THE session-5 root-cause fix.
+# 'shared' (skip_topk) indexer layers at PP stage starts consumed the
+# per-rank topk_indices_buffer holding the PREVIOUS batch's selections
+# (another request's under co-flight + MTP) -> build-time cache
+# poisoning -> the long-context copy corruption. The fix ships the last
+# full-indexer selections across each PP hop via IntermediateTensors and
+# seeds the receiving rank's buffer. Perf cost ~= 0 (measured).
+# GLM52_PP_TOPK_RELAY=0 disables (DEBUG ONLY -- the bug returns).
+
+# GLM52_MOE_ALIGN_DET: deterministic moe_align token ordering
+# (patch_moe_align_det.py). The CUDA op's atomic arrival order makes the
+# fused Marlin MoE bitwise-nondeterministic per call -- the second lottery
+# behind the long-context copy corruption (the first was topk tie-breaks).
+# Verified: with this on, fused_marlin_moe is bit-stable across repeated
+# calls, quiet and under transfer contention. Set 0 to restore the CUDA op.
+export GLM52_MOE_ALIGN_DET=${GLM52_MOE_ALIGN_DET-1}
+
+# GLM52_META_SNAPSHOT: metadata clone-at-build (patch_meta_snapshot.py).
+# MUST STAY 0: cloning decode metadata breaks FULL cudagraph replays
+# catastrophically (7/7 garbage) -- graphs receive fresh metadata only
+# through the persistent-buffer aliasing the clone severs. Failed detour
+# from the layer-3 hunt, kept only as a historical repro knob.
+export GLM52_META_SNAPSHOT=${GLM52_META_SNAPSHOT-0}
+
 EAGER_ARGS=()
 if [ "${EAGER:-0}" = "1" ]; then
   EAGER_ARGS=(--enforce-eager)
@@ -334,6 +385,7 @@ exec "$VENV/bin/vllm" serve "$MODEL" \
   --gpu-memory-utilization "${GPU_UTIL:-0.93}" \
   --max-num-seqs "${MAX_SEQS:-32}" \
   --kv-cache-dtype "$KV_CACHE_DTYPE" \
+  ${PREFIX_CACHE:+ } $( [ "${PREFIX_CACHE:-1}" = "0" ] && echo --no-enable-prefix-caching ) \
   --block-size "${BLOCK_SIZE:-64}" \
   --dtype "${DTYPE:-bfloat16}" \
   --trust-remote-code \

@@ -104,6 +104,43 @@ declaring float16.
 | `patch_lmhead_quant.py` | runtime lm_head quantization to Marlin W8A16 |
 | `patch_idx_prefill_buf.py` | caps the indexer prefill buffer (3.17 GB at 600K ctx OOMs capture) |
 
+### Correctness fixes (silent long-context corruption + MTP acceptance)
+
+A multi-week investigation into rare, silent, plausible-token corruption at long
+context (temp 0, verbatim-copy tasks, ~1-in-a-million tokens, concurrency- and
+MTP-dependent) root-caused **three independent bugs**, each with its own patch
+and writeup. None of them are sm80-specific — they apply to any DSA model with
+shared indexer layers served under pipeline parallelism on stock vLLM.
+
+| script | what it fixes |
+|---|---|
+| `patch_pp_topk_relay.py` | **The main one.** PP rank-boundary stale `topk_indices_buffer`: shared (skip-topk) indexer layers at the start of each PP stage attend with the *previous batch's* selections because the sharing full-indexer layer ran on the previous rank and the buffer is per-rank. Fix: relay the selections across the hop inside `IntermediateTensors` and seed the receiving rank's buffer. ≈0 cost. |
+| `patch_topk_det.py` + `patch_topk_canon.py` + `glm52_topk_canon.py` | Decode-topk tie lottery: fp8 indexer logits tie constantly and the stock kernels break ties nondeterministically → temp-0 selection flips. `GLM52_TOPK_DET=canon` = canonical (score desc, index asc) tie-break kernel, ~0.24 ms/layer, capture-safe. |
+| `patch_prefill_topk_canon.py` + `patch_prefill_topk_relfix.py` | Same lottery on the prefill path (makes KV builds bit-reproducible), windowed canon kernel ~3.8 ms per 2048×131072 call. |
+| `patch_moe_align_det.py` | Deterministic `moe_align_block_size` (atomics arrival-order → run-to-run wobble). Measured ≈0 cost; kept as free hygiene. |
+| `patch_bt_selfpad.py` | Block-table row tails keep the previous tenant's block ids; the indexer expand path copies full row width and can walk into another request's pages. Self-pads the tail. |
+| `patch_reorder_decodes.py` | The DSA metadata builder never declares its decode-first reorder requirement, so spec-decode tokens can be misclassified into the prefill bucket. |
+
+Full analyses, evidence, and upstream-ready framing:
+
+- `upstream_writeup_pp_stale_indexer_buffer.md` — the PP boundary bug (mechanism,
+  per-rank cachemap proof, fix design, validation: 0/21 vs 14/21 pre-fix)
+- `upstream_writeup_topk_lottery.md` — the tie-break lottery
+- `upstream_writeup_block_table_tails.md` — the stale row tails
+- `upstream_writeup_attr_sniffed_mtp_buffer_sharing.md` — a trap discovered while
+  fixing the above: vLLM's drafter loader attr-sniffs `topk_indices_buffer` on the
+  target model and silently rebinds the drafter's buffer, halving MTP acceptance
+
+**Quick self-check for GLM-5.2 operators**: if you serve with `PP > 1`, look at
+your stage boundaries. Full-indexer layers sit at 0,1,2 then every 4th layer
+(2+4k); a stage that *starts on any other layer* has this bug — including the
+default even split (78 layers / PP=2 splits at L39: affected). Symptoms are
+subtle: occasional single-token "typos" in long verbatim reproduction, degraded
+long-context quality under concurrent load, and depressed MTP acceptance — the
+model just "feels stupider" than it should at long context. Also grep your boot
+log for `"Sharing target model topk_indices_buffer"` — if present, your MTP
+drafter has been hijacked by the attr-sniffing trap (see the fourth writeup).
+
 ### Custom kernels
 
 | file | |

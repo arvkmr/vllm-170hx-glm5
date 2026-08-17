@@ -9,6 +9,7 @@
 
 !.gitignore
 !README.md
+!upstream_writeup_*.md
 !*.py
 !*.sh
 !*.cu
