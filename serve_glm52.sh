@@ -304,6 +304,7 @@ export GLM52_CAP_PREFILL_GUARD=${GLM52_CAP_PREFILL_GUARD-0}
 # full-indexer selections across each PP hop via IntermediateTensors and
 # seeds the receiving rank's buffer. Perf cost ~= 0 (measured).
 # GLM52_PP_TOPK_RELAY=0 disables (DEBUG ONLY -- the bug returns).
+export GLM52_PP_TOPK_RELAY=${GLM52_PP_TOPK_RELAY-1}
 
 # GLM52_MOE_ALIGN_DET: deterministic moe_align token ordering
 # (patch_moe_align_det.py). The CUDA op's atomic arrival order makes the
@@ -368,7 +369,9 @@ done
 echo "config: PP=$PP spec=$SPEC_TOKENS decode_batch_cap=$GLM52_PP_DECODE_BATCH_CAP" \
      "fullcg=$GLM52_DSA_FULLCG adaptive_cap=$GLM52_PP_DECODE_ADAPTIVE lmhead_bits=$GLM52_LMHEAD_BITS" \
      "max_len=${MAX_LEN:-262144} kv_bytes=${KV_CACHE_MEM:-unset}" \
-     "kv_dtype=$KV_CACHE_DTYPE fullcg_maxlen=$GLM52_DSA_FULLCG_MAXLEN" >&2
+     "kv_dtype=$KV_CACHE_DTYPE fullcg_maxlen=$GLM52_DSA_FULLCG_MAXLEN" \
+     "relay=$GLM52_PP_TOPK_RELAY topk_det=$GLM52_TOPK_DET prefill_det=$GLM52_PREFILL_TOPK_DET" \
+     "moe_align_det=$GLM52_MOE_ALIGN_DET guard=$GLM52_CAP_PREFILL_GUARD" >&2
 
 exec "$VENV/bin/vllm" serve "$MODEL" \
   "${SPEC_ARGS[@]}" \
