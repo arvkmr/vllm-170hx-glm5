@@ -198,8 +198,8 @@ edit(
 # doing that inside a cudagraph capture (GLM52_DSA_FULLCG=1) is fatal.
 edit(
     TMS,
-    "        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
-    "        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
+    "        q = torch.zeros(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
+    "        kv = torch.zeros(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
     "        indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)\n"
     "        for splits in KV_SPLITS_CANDIDATES:\n"
     "            triton_mla_sparse_attention(\n"
@@ -210,7 +210,7 @@ edit(
     "                num_kv_splits=splits,\n"
     "                sm_count=self._sm_count,\n"
     "            )",
-    "        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
+    "        q = torch.zeros(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
     "        indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)\n"
     "        if self._fp8_kv:\n"
     "            kv_fp8 = torch.zeros(\n"
@@ -226,7 +226,7 @@ edit(
     "                    sm_count=self._sm_count,\n"
     "                )\n"
     "        else:\n"
-    "            kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
+    "            kv = torch.zeros(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)\n"
     "            for splits in KV_SPLITS_CANDIDATES:\n"
     "                triton_mla_sparse_attention(\n"
     "                    q,\n"

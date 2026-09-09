@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Serve GLM-5.2 (753B DSA MoE, AWQ-INT4 g64) across 8 GPUs with pipeline
+# Serve GLM-5.3 (753B DSA MoE, AWQ-INT4 g64) across 8 GPUs with pipeline
 # parallelism (PP=8).
 #
-# GLM-5.2 uses DeepSeek Sparse Attention. Upstream vLLM only has Hopper/Blackwell
+# GLM-5.3 uses DeepSeek Sparse Attention. Upstream vLLM only has Hopper/Blackwell
 # sparse-MLA backends (FLASHMLA_SPARSE) and DeepGEMM's fp8_mqa_logits, none of
 # which build for sm_80. This box runs the TRITON_MLA_SPARSE backend from vLLM
 # PR #38476, hand-applied into the venv's site-packages (see logs/ and the
@@ -14,11 +14,10 @@ set -euo pipefail
 cd /home/user/vllm_install
 
 VENV=/home/user/vllm_install/.venv
-# On the NFS "fast" export, which reads at ~690 MB/s -- unlike
-# the "share" export used for MiniMax, this one is quick enough to load from
-# directly (~10 min for 390 GB). The mount is NOT restored on boot; remount
-# before running if this path is empty.
-MODEL=${MODEL:-/home/user/srv/fast/models/GLM-5.2-AWQ-g64}
+# Local SSD copy (rsynced 2026-09-02 from the NAS "fast" export at
+# /home/user/srv/fast/models/GLM-5.3-AWQ-g64). Loading locally avoids the
+# NFS mount, which is NOT restored on boot.
+MODEL=${MODEL:-/home/user/models/GLM-5.3-AWQ-g64}
 PORT=${PORT:-8000}
 
 # PP=8, not TP=8: the GPUs sit on PCIe gen2 x4, so TP's per-layer all-reduces
@@ -214,6 +213,11 @@ export GLM52_LMHEAD_BITS=${GLM52_LMHEAD_BITS-8}
 # emulation). Default auto = marlin (first supported in priority order).
 # humming's "indexed" gemm is the small-batch candidate; see
 # glm52-decode-profiling memory note.
+# KERNEL_CFG_JSON: extra --kernel-config entries (JSON object body without braces), e.g.
+#   KERNEL_CFG_JSON='"ir_op_priority":{"rms_norm":["vllm_c"],"fused_add_rms_norm":["vllm_c"]}'
+# routes RMSNorm to vLLM's CUDA kernels inside the compiled graph (Inductor's native
+# RMSNorm re-benchmarks its reduction config per boot -> per-boot ULP lottery, see
+# TYPO_INVESTIGATION.md 16.7).
 # DEFAULT ON (2026-09-09): closes the per-boot output lottery -- two boots with it are
 # bit-identical (run 37); set KERNEL_CFG_JSON="" to get Inductor's native RMSNorm back.
 # GLM52_GATE_FP32=1 (DEFAULT ON, 2026-09-09): MoE router logits from a true fp32 GEMM. On
@@ -227,6 +231,7 @@ KERNEL_ARGS=()
 KC=""
 [ -n "${MOE_BACKEND:-}" ] && KC="\"moe_backend\":\"$MOE_BACKEND\""
 if [ -n "${KERNEL_CFG_JSON:-}" ]; then KC="${KC:+$KC,}$KERNEL_CFG_JSON"; fi
+[ -n "$KC" ] && KERNEL_ARGS=(--kernel-config "{$KC}")
 
 # EAGER=1 skips ALL CUDA graph capture (boots ~9 min faster; decode ~2x
 # slower) -- use for crash-repro / debug restarts where perf is irrelevant.
@@ -331,7 +336,11 @@ export GLM52_PP_TOPK_RELAY=${GLM52_PP_TOPK_RELAY-1}
 # gemv beats the Marlin small-batch floor; prefill unaffected). Aug tested this
 # ("failed 2/7") but cross-boot build-lottery masked it -- see the same-boot A/B
 # harness in coflight_probe/. Set 0 to restore the stock fused MoE.
-export GLM52_SPLIT_MOE=${GLM52_SPLIT_MOE:-1}
+# 2026-09-08: default OFF. The per-row gemv decode path costs ~40% decode throughput
+# (prose 19->33 tok/s, code 20->35 with it off; bench_split.py measured only eager mixed
+# batches because FULL graphs had stock Marlin baked in) and it does not fix the
+# corruption (TYPO_INVESTIGATION.md §12/§16). Set 1 to re-enable.
+export GLM52_SPLIT_MOE=${GLM52_SPLIT_MOE:-0}
 
 export GLM52_MOE_ALIGN_DET=${GLM52_MOE_ALIGN_DET-1}
 
@@ -341,10 +350,10 @@ export GLM52_MOE_ALIGN_DET=${GLM52_MOE_ALIGN_DET-1}
 # through the persistent-buffer aliasing the clone severs. Failed detour
 # from the layer-3 hunt, kept only as a historical repro knob.
 export GLM52_META_SNAPSHOT=${GLM52_META_SNAPSHOT-0}
+# Re-compensate the AWQ smoothing fold on mlp.gate / indexer.wq_b (checkpoint
+# defect, TYPO_INVESTIGATION.md §14.4). Set GLM52_ROUTER_FIX= (empty) to disable.
 export GLM52_WEIGHT_HASH=${GLM52_WEIGHT_HASH-1}
-# Re-compensate the AWQ smoothing fold on mlp.gate / indexer.wq_b (same checkpoint
-# defect as GLM-5.3, TYPO_INVESTIGATION.md §14.4). GLM52_ROUTER_FIX= (empty) disables.
-export GLM52_ROUTER_FIX=${GLM52_ROUTER_FIX-/home/user/vllm_install/router_fix_glm52_s.pt}
+export GLM52_ROUTER_FIX=${GLM52_ROUTER_FIX-/home/user/vllm_install/router_fix_glm53_s.pt}
 
 EAGER_ARGS=()
 if [ "${EAGER:-0}" = "1" ]; then
@@ -357,6 +366,18 @@ else
   if [ -n "${GRAPH_MODE:-}" ]; then
     [ "$CC_JSON" != "{" ] && CC_JSON="$CC_JSON,"
     CC_JSON="$CC_JSON\"cudagraph_mode\":\"$GRAPH_MODE\""
+  fi
+  # INDUCTOR_CFG_JSON='{"deterministic": true}' merges extra torch._inductor config
+  # (applied by vLLM inside the compile call; part of the compile-cache key).
+  # CUSTOM_OPS_JSON='["all"]' selects vLLM CUDA custom ops inside the compiled graph
+  # instead of Inductor-generated norm/activation kernels (compile-cache key changes).
+  if [ -n "${CUSTOM_OPS_JSON:-}" ]; then
+    [ "$CC_JSON" != "{" ] && CC_JSON="$CC_JSON,"
+    CC_JSON="$CC_JSON\"custom_ops\":$CUSTOM_OPS_JSON"
+  fi
+  if [ -n "${INDUCTOR_CFG_JSON:-}" ]; then
+    [ "$CC_JSON" != "{" ] && CC_JSON="$CC_JSON,"
+    CC_JSON="$CC_JSON\"inductor_compile_config\":$INDUCTOR_CFG_JSON"
   fi
   CC_JSON="$CC_JSON}"
   if [ "$CC_JSON" != "{}" ]; then
@@ -396,7 +417,8 @@ echo "config: PP=$PP spec=$SPEC_TOKENS decode_batch_cap=$GLM52_PP_DECODE_BATCH_C
      "max_len=${MAX_LEN:-409600} kv_bytes=${KV_CACHE_MEM:-unset}" \
      "kv_dtype=$KV_CACHE_DTYPE fullcg_maxlen=$GLM52_DSA_FULLCG_MAXLEN" \
      "relay=$GLM52_PP_TOPK_RELAY topk_det=$GLM52_TOPK_DET prefill_det=$GLM52_PREFILL_TOPK_DET" \
-     "moe_align_det=$GLM52_MOE_ALIGN_DET guard=$GLM52_CAP_PREFILL_GUARD" >&2
+     "moe_align_det=$GLM52_MOE_ALIGN_DET guard=$GLM52_CAP_PREFILL_GUARD split_moe=$GLM52_SPLIT_MOE" \
+     "router_fix=${GLM52_ROUTER_FIX:-off}" "kernel_cfg=${KC:-none}" "gate_fp32=$GLM52_GATE_FP32" >&2
 
 exec "$VENV/bin/vllm" serve "$MODEL" \
   "${SPEC_ARGS[@]}" \
@@ -404,7 +426,7 @@ exec "$VENV/bin/vllm" serve "$MODEL" \
   "${PROF_ARGS[@]}" \
   "${KERNEL_ARGS[@]}" \
   "${EAGER_ARGS[@]}" \
-  --served-model-name glm-5.2 \
+  --served-model-name glm-5.3 \
   --pipeline-parallel-size "$PP" \
   --tensor-parallel-size "$TP" \
   --attention-backend "$BACKEND" \

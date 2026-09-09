@@ -103,6 +103,12 @@ declaring float16.
 | `patch_mqa_store_clamp.py` | fixes an OOB `-inf` store in the sm80 paged MQA kernel under FULL capture |
 | `patch_lmhead_quant.py` | runtime lm_head quantization to Marlin W8A16 |
 | `patch_idx_prefill_buf.py` | caps the indexer prefill buffer (3.17 GB at 600K ctx OOMs capture) |
+| `patch_precision_knobs.py` | **fp32 MoE router logits** (`GLM52_GATE_FP32=1`, default on) -- on non-Hopper GPUs the gate silently rounds routing logits to bf16; this was the garbage-token amplifier. Also `GLM52_IDX_Q_BF16` (bf16 indexer query; measured useless, off) |
+| `patch_router_fix.py` + `make_router_fix.py` | re-compensates an AWQ smoothing fold the recipe left off the router gate and indexer `wq_b` (`GLM52_ROUTER_FIX=<s.pt>`, default on); the generator recovers the scales from the AWQ + bf16 checkpoints |
+| `patch_split_moe.py` + `_glm52_moe_split.py` | batch-composition-invariant decode rows through the Marlin-packed GEMV (`GLM52_SPLIT_MOE=1`); wired, **off by default** (~40% decode cost) |
+| `patch_step_trace.py` + `_glm52_steptrace.py` | env-gated diagnostics (step trace, weight fingerprints, allocator poison, deterministic fill, op-boundary hashes) and the fp32 gate weight pre-cast hook |
+| `patch_tap.py` + `_glm52_tap.py` | graph taps: fingerprint intermediates of the *compiled* graph (`GLM52_TAP=<layers>`, needs a fresh `VLLM_CACHE_ROOT`) |
+| `patch_mp_executable.py` | spawn workers through a wrapper interpreter (`GLM52_MP_EXECUTABLE`), e.g. compute-sanitizer |
 
 ### Correctness fixes (silent long-context corruption + MTP acceptance)
 
@@ -120,6 +126,9 @@ shared indexer layers served under pipeline parallelism on stock vLLM.
 | `patch_moe_align_det.py` | Deterministic `moe_align_block_size` (atomics arrival-order → run-to-run wobble). Measured ≈0 cost; kept as free hygiene. |
 | `patch_bt_selfpad.py` | Block-table row tails keep the previous tenant's block ids; the indexer expand path copies full row width and can walk into another request's pages. Self-pads the tail. |
 | `patch_reorder_decodes.py` | The DSA metadata builder never declares its decode-first reorder requirement, so spec-decode tokens can be misclassified into the prefill bucket. |
+| `patch_precision_knobs.py` (`GLM52_GATE_FP32`) | **Router logits rounded to bf16 on every non-SM90 GPU** (`GateLinear` fallback). Needle probe at 85K under concurrency: 22/22 correct with fp32 routing vs 6/22 without, garbage tokens gone, throughput unchanged. |
+| `KERNEL_CFG_JSON` (serve default) | Inductor re-benchmarks its RMSNorm reduction kernels per boot, so compiled boots differed at ULP level from layer 0 on. Routing the norms to vLLM's CUDA kernels (`ir_op_priority`) makes boots bit-identical. |
+| `patch_router_fix.py` + `make_router_fix.py` | AWQ smoothing scales folded into the norms but never compensated on `mlp.gate` / `indexer.wq_b` (routing agreement with the original 8-57% -> 99.8%). |
 
 Full analyses, evidence, and upstream-ready framing:
 
@@ -130,6 +139,10 @@ Full analyses, evidence, and upstream-ready framing:
 - `upstream_writeup_attr_sniffed_mtp_buffer_sharing.md` — a trap discovered while
   fixing the above: vLLM's drafter loader attr-sniffs `topk_indices_buffer` on the
   target model and silently rebinds the drafter's buffer, halving MTP acceptance
+- `upstream_writeup_router_precision_and_boot_lottery.md` — the September 2026
+  round: bf16-rounded router logits on non-Hopper GPUs (the garbage-token amplifier),
+  per-boot Inductor RMSNorm autotune (boot-to-boot nondeterminism, how it was localized
+  with graph taps), the AWQ fold defect, and batch-composition sensitivity
 
 **Quick self-check for GLM-5.2 operators**: if you serve with `PP > 1`, look at
 your stage boundaries. Full-indexer layers sit at 0,1,2 then every 4th layer
@@ -157,20 +170,25 @@ drafter has been hijacked by the attr-sniffing trap (see the fourth writeup).
 ```bash
 ./start_glm52.sh          # detached launch + health wait; cold start ~13 min
 ./stop_glm52.sh           # kills workers by the pids nvidia-smi reports
+./start_glm53.sh          # GLM-5.3: same stack, same knobs (serve_glm53.sh / stop_glm53.sh)
 ```
 
-Defaults are the validated configuration: PP=8, MTP k=3, fp8 KV, 262,144 context at 4.00x
+Defaults are the validated configuration: PP=8, MTP k=3, fp8 KV, 409,600 context at 2.56x
 concurrency. Override with env vars:
 
 | env | default | |
 |---|---|---|
-| `MAX_LEN` | `262144` | `1048576` for the full 1M context (1.00x concurrency, ~10 min TTFT) |
+| `MAX_LEN` | `409600` | `262144` for 4.00x concurrency; `1048576` for the full 1M context (1.00x concurrency, ~10 min TTFT) |
 | `KV_CACHE_DTYPE` | `fp8_ds_mla` | `auto` for the bf16 cache |
 | `KV_CACHE_MEM` | `8258584576` | bytes/rank; this value gives exactly 1,048,576 KV tokens |
 | `SPEC_TOKENS` | `3` | `0` disables MTP |
 | `GLM52_PP_DECODE_BATCH_CAP` | `2` | decodes per scheduled batch |
 | `GLM52_PP_DECODE_ADAPTIVE` | `8` | below this many decoders, drop the cap to 1; `0` disables |
 | `GLM52_DSA_FULLCG_MAXLEN` | `0` | `2048` restores the (redundant) piecewise gate |
+| `GLM52_GATE_FP32` | `1` | fp32 MoE router logits; `0` = stock bf16 fallback (garbage tokens at long context) |
+| `GLM52_ROUTER_FIX` | `router_fix_glm5x_s.pt` | AWQ fold compensation for the router/indexer; build the file with `make_router_fix.py`; empty disables |
+| `KERNEL_CFG_JSON` | `ir_op_priority rms_norm/fused_add_rms_norm -> vllm_c` | bit-identical boots; `""` = Inductor native norms (per-boot lottery) |
+| `GLM52_SPLIT_MOE` | `0` | `1` = composition-invariant decode rows, ~40% slower decode |
 
 Every knob is echoed in a `config:` line at boot, and the script warns loudly if a diagnostic
 env (`GLM52_PROF`, `GLM52_IDXVAL`, tripwire) is left set.
@@ -201,6 +219,8 @@ Both were found by measurement, not by reading code, and both look fine in the l
 | `test_idx_prefill_v2.py` | prefill logits v2 vs v1, bit-exactness |
 | `test_moe_gemv.py` | MoE GEMV vs `moe_wna16_marlin_gemm` on identical packed buffers |
 | `idx_bench.py`, `idx_prefill_bench.py` | DSA indexer microbenchmarks |
+| `copyfid_glm52.py` | verbatim-copy fidelity vs context length, placement and concurrency (temp 0) |
+| `test_moe_split.py` | split-MoE GEMV path vs fused Marlin on identical rows |
 
 **Benchmarking traps on this setup**, all of which produced wrong conclusions before being found:
 

@@ -135,15 +135,19 @@ _SPLIT_MAX_OCCUPANCY = 4
 
 
 @triton.jit
-def _e4m3_bytes_to_bf16(b):
+def _e4m3_bytes_to_bf16(b, IS_FP16: tl.constexpr):
     """Decode e4m3 bytes to bf16 holding `value / 256`. See module docstring.
 
     The 1/256 is not corrected here -- callers fold it into the group scale.
     """
     u = b.to(tl.uint16)
     packed = ((u & 0x7F) << 7) | ((u & 0x80) << 8)
-    # bf16 keeps every e4m3 value exactly: 4 significant bits into 8.
-    return packed.to(tl.float16, bitcast=True).to(tl.bfloat16)
+    # The bit-trick lands in fp16 natively; bf16 keeps every e4m3 value
+    # exactly too (4 significant bits into 8). Caller picks via IS_FP16.
+    v = packed.to(tl.float16, bitcast=True)
+    # single return: target dtype resolved at specialization (fp16 .to()
+    # is a no-op; Triton rejects branch-divergent return types)
+    return v.to(tl.float16 if IS_FP16 else tl.bfloat16)
 
 
 @triton.jit
@@ -160,7 +164,7 @@ def _load_q_group(q_buffer, cur_q, cur_head, mask_h, g, stride_q_token, stride_q
 
 
 @triton.jit
-def _load_kv_group(kv_u8, indices, mask_kv, g, stride_kv_token, TRANSPOSED: tl.constexpr):
+def _load_kv_group(kv_u8, indices, mask_kv, g, stride_kv_token, TRANSPOSED: tl.constexpr, IS_FP16: tl.constexpr):
     """Load one 128-dim group of the NoPE latent for BLOCK_N tokens.
 
     TRANSPOSED=True  -> [BLOCK_N, 128], token-major, for the PV dot.
@@ -173,7 +177,7 @@ def _load_kv_group(kv_u8, indices, mask_kv, g, stride_kv_token, TRANSPOSED: tl.c
     else:
         ptr = kv_u8 + indices[None, :] * stride_kv_token + offs[:, None]
         raw = tl.load(ptr, mask=mask_kv[None, :], other=0)
-    return _e4m3_bytes_to_bf16(raw)
+    return _e4m3_bytes_to_bf16(raw, IS_FP16)
 
 
 @triton.jit
@@ -197,6 +201,7 @@ def _sparse_mla_compute_tile_fp8(
     sm_scale,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FP16: tl.constexpr,
 ):
     """fp8_ds_mla twin of `_sparse_mla_compute_tile`.
 
@@ -257,10 +262,10 @@ def _sparse_mla_compute_tile_fp8(
 
         # -- QK. The group is the contraction axis, so each group's scale is a
         # plain row broadcast on the fp32 dot result.
-        k0 = _load_kv_group(kv_u8, safe_idx, mask_kv, 0, K_U8_STRIDE, False)
-        k1 = _load_kv_group(kv_u8, safe_idx, mask_kv, 1, K_U8_STRIDE, False)
-        k2 = _load_kv_group(kv_u8, safe_idx, mask_kv, 2, K_U8_STRIDE, False)
-        k3 = _load_kv_group(kv_u8, safe_idx, mask_kv, 3, K_U8_STRIDE, False)
+        k0 = _load_kv_group(kv_u8, safe_idx, mask_kv, 0, K_U8_STRIDE, False, IS_FP16)
+        k1 = _load_kv_group(kv_u8, safe_idx, mask_kv, 1, K_U8_STRIDE, False, IS_FP16)
+        k2 = _load_kv_group(kv_u8, safe_idx, mask_kv, 2, K_U8_STRIDE, False, IS_FP16)
+        k3 = _load_kv_group(kv_u8, safe_idx, mask_kv, 3, K_U8_STRIDE, False, IS_FP16)
         qk = tl.dot(q0, k0) * sc0[None, :]
         qk += tl.dot(q1, k1) * sc1[None, :]
         qk += tl.dot(q2, k2) * sc2[None, :]
@@ -284,14 +289,14 @@ def _sparse_mla_compute_tile_fp8(
         p = tl.exp2(qk - n_e_max[:, None])
 
         # -- PV. The group is the output axis: pre-scale `p` per group instead.
-        v0 = _load_kv_group(kv_u8, safe_idx, mask_kv, 0, K_U8_STRIDE, True)
-        v1 = _load_kv_group(kv_u8, safe_idx, mask_kv, 1, K_U8_STRIDE, True)
-        v2 = _load_kv_group(kv_u8, safe_idx, mask_kv, 2, K_U8_STRIDE, True)
-        v3 = _load_kv_group(kv_u8, safe_idx, mask_kv, 3, K_U8_STRIDE, True)
-        acc0 = acc0 * re_scale[:, None] + tl.dot((p * sc0[None, :]).to(tl.bfloat16), v0)
-        acc1 = acc1 * re_scale[:, None] + tl.dot((p * sc1[None, :]).to(tl.bfloat16), v1)
-        acc2 = acc2 * re_scale[:, None] + tl.dot((p * sc2[None, :]).to(tl.bfloat16), v2)
-        acc3 = acc3 * re_scale[:, None] + tl.dot((p * sc3[None, :]).to(tl.bfloat16), v3)
+        v0 = _load_kv_group(kv_u8, safe_idx, mask_kv, 0, K_U8_STRIDE, True, IS_FP16)
+        v1 = _load_kv_group(kv_u8, safe_idx, mask_kv, 1, K_U8_STRIDE, True, IS_FP16)
+        v2 = _load_kv_group(kv_u8, safe_idx, mask_kv, 2, K_U8_STRIDE, True, IS_FP16)
+        v3 = _load_kv_group(kv_u8, safe_idx, mask_kv, 3, K_U8_STRIDE, True, IS_FP16)
+        acc0 = acc0 * re_scale[:, None] + tl.dot((p * sc0[None, :]).to(v0.dtype), v0)
+        acc1 = acc1 * re_scale[:, None] + tl.dot((p * sc1[None, :]).to(v1.dtype), v1)
+        acc2 = acc2 * re_scale[:, None] + tl.dot((p * sc2[None, :]).to(v2.dtype), v2)
+        acc3 = acc3 * re_scale[:, None] + tl.dot((p * sc3[None, :]).to(v3.dtype), v3)
 
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
@@ -321,6 +326,7 @@ def _sparse_mla_fp8_kernel_final(
     kv_group_num: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FP16: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -351,6 +357,7 @@ def _sparse_mla_fp8_kernel_final(
         sm_scale,
         BLOCK_H,
         BLOCK_N,
+        IS_FP16,
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 -> NaN from 0/0).
@@ -358,13 +365,13 @@ def _sparse_mla_fp8_kernel_final(
     offs_g = tl.arange(0, K_GROUP)
     base = out_ptr + cur_q * stride_out_token + cur_head[:, None] * stride_out_head
     tl.store(base + (0 * K_GROUP + offs_g)[None, :],
-             (acc0 / e_sum_safe[:, None]).to(tl.bfloat16), mask=mask_h[:, None])
+             (acc0 / e_sum_safe[:, None]).to(tl.float16 if IS_FP16 else tl.bfloat16), mask=mask_h[:, None])
     tl.store(base + (1 * K_GROUP + offs_g)[None, :],
-             (acc1 / e_sum_safe[:, None]).to(tl.bfloat16), mask=mask_h[:, None])
+             (acc1 / e_sum_safe[:, None]).to(tl.float16 if IS_FP16 else tl.bfloat16), mask=mask_h[:, None])
     tl.store(base + (2 * K_GROUP + offs_g)[None, :],
-             (acc2 / e_sum_safe[:, None]).to(tl.bfloat16), mask=mask_h[:, None])
+             (acc2 / e_sum_safe[:, None]).to(tl.float16 if IS_FP16 else tl.bfloat16), mask=mask_h[:, None])
     tl.store(base + (3 * K_GROUP + offs_g)[None, :],
-             (acc3 / e_sum_safe[:, None]).to(tl.bfloat16), mask=mask_h[:, None])
+             (acc3 / e_sum_safe[:, None]).to(tl.float16 if IS_FP16 else tl.bfloat16), mask=mask_h[:, None])
 
 
 @triton.autotune(
@@ -395,6 +402,7 @@ def _sparse_mla_fp8_kernel_split(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LOGE2: tl.constexpr,
+    IS_FP16: tl.constexpr,
 ):
     """Stage 1 of split-KV: one slice of the topk axis -> (out, lse) partials."""
     cur_q = tl.program_id(0)
@@ -430,6 +438,7 @@ def _sparse_mla_fp8_kernel_split(
         sm_scale,
         BLOCK_H,
         BLOCK_N,
+        IS_FP16,
     )
 
     # When a split has no valid KV (`e_sum == 0`), guard the divide so the mid
@@ -523,7 +532,9 @@ def triton_mla_sparse_attention_fp8(
     # allocations are 256B-aligned, so both reinterpretations are legal.
     kv_u8 = kv
     kv_f32 = kv.view(torch.float32)
-    kv_bf16 = kv.view(torch.bfloat16)
+    # RoPE lanes are stored as raw 2-byte model-dtype values (writer probe
+    # 2026-08-16): view them as q.dtype so fp16 serving reads fp16 lanes.
+    kv_bf16 = kv.view(q.dtype)
     seq_kv = kv.shape[0]
 
     kv_group_num = num_heads_q
@@ -537,7 +548,7 @@ def triton_mla_sparse_attention_fp8(
         )
 
     out = torch.empty(
-        (num_tokens, num_heads_q, _BLOCK_DV), dtype=torch.bfloat16, device=q.device
+        (num_tokens, num_heads_q, _BLOCK_DV), dtype=q.dtype, device=q.device
     )
 
     if num_kv_splits == 1:
@@ -560,6 +571,7 @@ def triton_mla_sparse_attention_fp8(
             index_topk=index_topk,
             kv_group_num=kv_group_num,
             BLOCK_H=_BLOCK_H,
+            IS_FP16=(q.dtype == torch.float16),
         )
         return out
 
@@ -590,6 +602,7 @@ def triton_mla_sparse_attention_fp8(
         kv_group_num=kv_group_num,
         BLOCK_H=_BLOCK_H,
         LOGE2=LOGE2,
+        IS_FP16=(q.dtype == torch.float16),
     )
 
     # Stage 2 is dtype-agnostic (fp32 partials), so reuse the bf16 kernel's.

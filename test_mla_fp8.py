@@ -200,6 +200,13 @@ def main():
         (8, 128, 2048, 8192, 4, 8, 0.30),
         (2, 128, 2048, 8192, 1, 9, 1.00),  # every index invalid
         (16, 64, 2048, 8192, 1, 10, 0.0),  # smaller head count
+        # Production slot counts: the live cache addresses 1,048,576 slots,
+        # 64x beyond the cases above. Slot 1,048,575 * 656 B = 6.9e8 stays
+        # under 2^31, but nothing below exercises the upper address range.
+        (1, 128, 2048, 1048576, 1, 20, 0.0),
+        (4, 128, 2048, 1048576, 4, 21, 0.0),
+        (32, 128, 2048, 1048576, 2, 22, 0.0),
+        (8, 128, 2048, 1048576, 1, 23, 0.30),  # partial-context padding
     ]
     ok = all([run_case(*c) for c in cases]) and decode_ok
 
