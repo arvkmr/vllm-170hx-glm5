@@ -180,6 +180,60 @@ def run_case(num_tokens, num_heads, topk, num_slots, splits, seed, invalid_frac=
     return ok
 
 
+def test_large_cache_addresses() -> bool:
+    """Exercise the real writer/reader above 2 GiB with a compact reference.
+
+    Allocate only the packed full-size cache; initialize sparse slots at the
+    address boundary and pool tail. Decoding millions of unused slots into
+    several reference tensors would consume tens of GiB and obscure failures.
+    """
+    num_slots = 4422272  # 20 GiB / (7 MLA + 2 indexers), block-aligned
+    boundary = (2**31 + ENTRY - 1) // ENTRY
+    slots = torch.cat([
+        torch.arange(256, device=DEV),
+        torch.arange(boundary - 128, boundary + 128, device=DEV),
+        torch.arange(num_slots - 1536, num_slots, device=DEV),
+    ]).to(torch.int64)
+    _, packed, decoded = build(slots.numel(), 20)
+    cache = torch.empty(num_slots, ENTRY, dtype=torch.uint8, device=DEV)
+    cache[slots] = packed
+    q = torch.randn(4, 128, DIM, device=DEV, dtype=torch.bfloat16)
+    local_idx = torch.arange(slots.numel(), device=DEV, dtype=torch.int32)
+    local_idx = local_idx.view(1, 1, -1).expand(4, 1, -1).contiguous()
+    physical_idx = slots[local_idx.long()].to(torch.int32)
+    # Include mixed padding and a completely empty query.
+    local_idx[1, :, ::3] = -1
+    physical_idx[1, :, ::3] = -1
+    local_idx[2] = -1
+    physical_idx[2] = -1
+    gold = ref_fp32(q, decoded, local_idx, DIM**-0.5)
+    ok = True
+    for splits in (1, 4):
+        kw = dict(sm_scale=DIM**-0.5, num_kv_splits=splits, sm_count=70)
+        baseline = triton_mla_sparse_attention(
+            q, decoded.to(torch.bfloat16).view(-1, 1, DIM), local_idx, **kw
+        )
+        got = triton_mla_sparse_attention_fp8(q, cache, physical_idx, **kw)
+        err, base_err = l2_err(got.float(), gold), l2_err(baseline.float(), gold)
+        passed = bool(torch.isfinite(got).all()) and err <= max(1.5 * base_err, 1e-3)
+        print(f"  >2 GiB reader, tail={num_slots - 1}, splits={splits}: "
+              f"err={err:.2e} {'OK' if passed else 'FAIL'}")
+        ok &= passed
+
+    # Also test stock vLLM's writer with high physical slot mappings. Compare
+    # packed bytes to the same inputs written at compact addresses.
+    kv_c = torch.randn(slots.numel(), LORA, device=DEV, dtype=torch.bfloat16)
+    k_pe = torch.randn(slots.numel(), ROPE, device=DEV, dtype=torch.bfloat16)
+    scale = torch.tensor(1.0, device=DEV)
+    ops.concat_and_cache_mla(kv_c, k_pe, cache.view(num_slots, 1, ENTRY),
+                             slots, "fp8_ds_mla", scale)
+    ops.concat_and_cache_mla(kv_c, k_pe, packed.view(-1, 1, ENTRY),
+                             torch.arange(slots.numel(), device=DEV), "fp8_ds_mla", scale)
+    writer_ok = torch.equal(cache[slots], packed)
+    print(f"  >2 GiB writer byte comparison: {'OK' if writer_ok else 'FAIL'}")
+    return ok and writer_ok
+
+
 def main():
     torch.cuda.set_device(0)
     print(f"device capability {torch.cuda.get_device_capability(0)}\n")
@@ -200,15 +254,10 @@ def main():
         (8, 128, 2048, 8192, 4, 8, 0.30),
         (2, 128, 2048, 8192, 1, 9, 1.00),  # every index invalid
         (16, 64, 2048, 8192, 1, 10, 0.0),  # smaller head count
-        # Production slot counts: the live cache addresses 1,048,576 slots,
-        # 64x beyond the cases above. Slot 1,048,575 * 656 B = 6.9e8 stays
-        # under 2^31, but nothing below exercises the upper address range.
-        (1, 128, 2048, 1048576, 1, 20, 0.0),
-        (4, 128, 2048, 1048576, 4, 21, 0.0),
-        (32, 128, 2048, 1048576, 2, 22, 0.0),
-        (8, 128, 2048, 1048576, 1, 23, 0.30),  # partial-context padding
     ]
     ok = all([run_case(*c) for c in cases]) and decode_ok
+    print("\nlarge cache addressing:")
+    ok = test_large_cache_addresses() and ok
 
     print("\nspeed (ms/call, decode-shaped; bf16 kernel for reference):")
     import triton

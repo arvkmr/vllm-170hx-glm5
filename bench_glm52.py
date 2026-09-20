@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 URL = "http://localhost:8000/v1/chat/completions"
+MODEL = "glm-5.2"
 # ~512 tokens of filler.
 PROMPT = ("Summarize the following note. " + "The system records an event. " * 120)[:2600]
 
@@ -19,7 +20,7 @@ PROMPT = ("Summarize the following note. " + "The system records an event. " * 1
 def one(gen_tokens):
     body = json.dumps(
         {
-            "model": "glm-5.2",
+            "model": MODEL,
             "messages": [{"role": "user", "content": PROMPT}],
             "max_tokens": gen_tokens,
             "min_tokens": gen_tokens,  # force a fixed decode length
@@ -58,9 +59,7 @@ def run(conc, gen_tokens):
     errs = [r for r in results if r[0] == "ERR"]
     ok = [r for r in results if r[0] != "ERR"]
     if errs:
-        print(f"  conc={conc}: {len(errs)} errors, first: {errs[0][1]}")
-    if not ok:
-        return
+        raise RuntimeError(f"conc={conc}: {len(errs)} errors, first: {errs[0][1]}")
     gen = sum(r[1] for r in ok)
     pro = sum(r[2] for r in ok)
     print(
@@ -74,8 +73,13 @@ def run(conc, gen_tokens):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--gen", type=int, default=128)
-    ap.add_argument("--conc", type=int, nargs="+", default=[1, 4, 8, 16, 32])
+    ap.add_argument("--model", default="glm-5.2")
+    ap.add_argument("--base-url", default="http://localhost:8000")
+    ap.add_argument("--conc", type=int, nargs="+", default=[1, 4, 8, 12, 16, 24, 32])
     a = ap.parse_args()
-    print(f"GLM-5.2 PP=8 throughput  (prompt~512 tok, gen={a.gen} tok, greedy)")
+    if a.gen <= 0 or any(c <= 0 for c in a.conc):
+        ap.error("generation and concurrency must be positive")
+    MODEL, URL = a.model, a.base_url.rstrip("/") + "/v1/chat/completions"
+    print(f"{MODEL} throughput  (prompt~512 tok, gen={a.gen} tok, greedy)")
     for c in a.conc:
         run(c, a.gen)

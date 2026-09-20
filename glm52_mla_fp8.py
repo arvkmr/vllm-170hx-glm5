@@ -78,6 +78,8 @@ _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 _QUANT_GROUP = 128
 _NUM_GROUPS = _BLOCK_DMODEL // _QUANT_GROUP  # 4
 _ENTRY_BYTES = 656
+# The launchers check the installed copy before enabling the enlarged cache.
+KV_ADDRESS_BITS = 64
 
 # Element offsets of each region, per view.
 _U8_STRIDE = _ENTRY_BYTES  # 656
@@ -251,7 +253,10 @@ def _sparse_mla_compute_tile_fp8(
             other=-1,
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
-        safe_idx = tl.where(mask_kv, indices, 0)
+        # Widen BEFORE multiplying by the entry stride. The 20 GiB/rank
+        # profile has 4.42M slots: its per-layer byte offsets exceed INT32_MAX
+        # even though the slot IDs themselves still fit in int32.
+        safe_idx = tl.where(mask_kv, indices, 0).to(tl.int64)
 
         # Group scales: [BLOCK_N] each, with the fp16-decode bias folded in.
         sc_base = kv_f32 + safe_idx * K_F32_STRIDE + K_F32_SCALE_OFF

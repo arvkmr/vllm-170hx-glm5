@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Stop the GLM-5.2 server and wait until the GPUs are genuinely free.
+# Stop the GLM-5.x server and wait until the GPUs are genuinely free.
 #
 # Two traps this works around, both of which caused spurious
 # "Free memory on device cuda:N ... is less than desired GPU memory utilization"
 # failures on the next launch:
 #
-#  1. Killing the `vllm serve` parent does NOT reap its 8 PP workers. They keep
+#  1. Killing the `vllm serve` parent does NOT reap its 12 PP workers. They keep
 #     running (and keep loading weights) as orphans.
 #  2. vLLM renames workers to "VLLM::Worker_PPn" -- uppercase, and with no
 #     "vllm serve" in the cmdline -- so pattern-matching on the launch command

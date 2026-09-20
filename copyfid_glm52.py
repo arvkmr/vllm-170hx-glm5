@@ -50,7 +50,7 @@ NAMES = [
     "glm52_idx_prefill_v2.py",
     "moe_gemv_marlin_bind.cpp",
     "patch_mqa_store_clamp.py",
-    "KV_CACHE_MEM=8258584576",
+    "KV_CACHE_MEM=21474836480",
     "GLM52_PP_DECODE_ADAPTIVE",
     "TRITON_MLA_SPARSE",
     "fp8_ds_mla",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Serve GLM-5.2 (753B DSA MoE, AWQ-INT4 g64) across 8 GPUs with pipeline
-# parallelism (PP=8).
+# Serve GLM-5.2 (753B DSA MoE, AWQ-INT4 g64) across 12 GPUs with pipeline
+# parallelism (PP=12).
 #
 # GLM-5.2 uses DeepSeek Sparse Attention. Upstream vLLM only has Hopper/Blackwell
 # sparse-MLA backends (FLASHMLA_SPARSE) and DeepGEMM's fp8_mqa_logits, none of
@@ -11,20 +11,18 @@ set -euo pipefail
 
 # Run from a neutral directory: launching from inside the installed vllm package
 # makes vllm/tokenizers/ shadow the real `tokenizers` package on sys.path.
-cd /home/user/vllm_install
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/glm_profile.sh"
+VLLM_INSTALL_DIR=${VLLM_INSTALL_DIR:-/home/user/vllm_install}
+cd "$VLLM_INSTALL_DIR"
 
-VENV=/home/user/vllm_install/.venv
+VENV=${VENV:-$VLLM_INSTALL_DIR/.venv}
 # On the NFS "fast" export, which reads at ~690 MB/s -- unlike
 # the "share" export used for MiniMax, this one is quick enough to load from
 # directly (~10 min for 390 GB). The mount is NOT restored on boot; remount
 # before running if this path is empty.
 MODEL=${MODEL:-/home/user/srv/fast/models/GLM-5.2-AWQ-g64}
 PORT=${PORT:-8000}
-
-# PP=8, not TP=8: the GPUs sit on PCIe gen2 x4, so TP's per-layer all-reduces
-# would dominate. PP only ships one activation tensor per stage boundary.
-PP=${PP:-8}
-TP=${TP:-1}
 
 # THE concurrency lever, and the easiest one to lose: stock vLLM merges every
 # ready decode into one lockstep batch, which leaves pipeline depth at 1 and the
@@ -53,32 +51,13 @@ export GLM52_PP_DECODE_BATCH_CAP=${GLM52_PP_DECODE_BATCH_CAP:-2}
 # requests are decoding. Best of both, measured with it on: 4x192K 71.1
 # (+55% vs constant cap=2), 4x64K 99.3, conc=16 202.7 (better than either
 # constant, and finally at the 203 ledger reference). 0 = constant cap.
-export GLM52_PP_DECODE_ADAPTIVE=${GLM52_PP_DECODE_ADAPTIVE:-8}
+export GLM52_PP_DECODE_ADAPTIVE=${GLM52_PP_DECODE_ADAPTIVE:-$PP}
 
-# KV budget: a fixed --kv-cache-memory per rank (DEFAULT, 5.5 GiB) beats the
-# GPU_UTIL fraction, which must clear the free-memory check on EVERY rank
-# while per-rank slack differs hugely (ranks 1-6 had 7.58 GiB available at
-# full utilization vs the 3.8 GiB the 0.93 fraction granted). 5.5 GiB leaves
-# ~2 GiB headroom on the tight ranks for long-context indexer transients and
-# yields 442,943 KV tokens (2.16x concurrency at the full 200K context).
-# Set KV_CACHE_MEM="" to fall back to the GPU_UTIL fraction; if you do:
-# a *fresh* card reports only ~59.6 GiB free of 63.39 (CUDA context + driver
-# reserve), so ~0.93 is the practical maximum for GPU_UTIL.
-# DEFAULT raised to 7.5 GiB on 2026-08-12: 604,032 KV tokens (was 442,943 at
-# 5.5 GiB), 2.30x concurrency at the full 262,144 context. Validated by a 5/5
-# needle sweep at 261,687 tokens with no OOM. Ranks 1-6 are the binding stages
-# and had ~5.4 GiB free above this reservation when idle, so the old ~2 GiB
-# pad for long-context indexer transients is now closer to ~1.5 GiB -- if a
-# heavy concurrent long-prefill workload ever OOMs a middle rank, this is the
-# first number to walk back.
-# DEFAULT raised again 2026-08-12 to 7.69 GiB, together with the fp8 KV cache
-# below: 7,876 B/token x 64 x 16,384 blocks = exactly **1,048,576 KV tokens**,
-# i.e. 2.56x concurrency at the 409,600 default context (4.00x at 262,144), or the model's full
-# 1M context in a single stream if you set MAX_LEN=1048576. Booting at 1M also
-# needs patch_fp8_kv.py edit 5 (it skips a 3.5 GiB profile-run reserve for a
-# dense-MHA prefill path this backend can never reach; without it 1M OOMs by
-# ~20 MB).
-KV_CACHE_MEM=${KV_CACHE_MEM-8258584576}
+# glm_profile.sh sets the topology and fixed KV budget: 20 GiB/rank for
+# the built-in PP=12 split, estimated 4,422,272 fp8 KV slots. This profile
+# needs on-host validation; KV_CACHE_MEM=12884901888 restores 12 GiB.
+# KV_CACHE_MEM="" uses vLLM profiling with GPU_UTIL (default 0.93).
+# A fresh card previously reported ~59.6 GiB free out of 63.39 GiB.
 
 # bf16, not the checkpoint's declared float16. The PR #38476 Triton kernels emit
 # bf16 unconditionally (`.to(tl.bfloat16)` in triton_mla_sparse_kernel.py and a
@@ -97,15 +76,13 @@ BACKEND=${BACKEND:-TRITON_MLA_SPARSE}
 # Keep the compile cache local so restarts skip torch.compile warmup.
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-/home/user/vllm_install/.vllm_cache}
 
-# 8 PP workers on 10 cores: leave OMP single-threaded or the workers thrash.
+# 12 PP workers: leave OMP single-threaded or the workers thrash.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 # torch.compile shells out to `ninja`, which only exists in the venv. Calling
 # $VENV/bin/vllm by absolute path does not put it on PATH, so add it here or
 # CUDA graph capture dies with FileNotFoundError: 'ninja'.
 export PATH="$VENV/bin:$PATH"
-
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 # flashinfer JIT-builds its sampling kernels with $CUDA_HOME/bin/nvcc on the
 # first sampler call -- which happens inside profile_run, ~6 min into startup.
@@ -129,7 +106,7 @@ fi
 # 78 (num_nextn_predict_layers=1) and vLLM maps model_type `glm_moe_dsa` ->
 # DeepSeekMTPModel, so `method: mtp` reuses this checkpoint as its own draft.
 #
-# Getting this working under PP=8 needed three patches to the venv (all backed
+# Getting this working under PP>1 needed three patches to the venv (all backed
 # up in .venv/.../.glm52-backup/), because upstream never exercises MTP+PP:
 #   1. deepseek_mtp.py: DeepSeekMTP now declares SupportsPP. The draft config
 #      inherits the target's pipeline_parallel_size, so without the flag
@@ -139,12 +116,12 @@ fi
 #   2. gpu_model_runner.py: the drafter is created only on the last PP rank, but
 #      initialize_kv_cache / cudagraph-dispatcher init / attn-metadata build /
 #      _dummy_run all dereferenced it on every rank, gated only on
-#      `speculative_config` -> AttributeError on ranks 0-6. Guarded each with
+#      `speculative_config` -> AttributeError on non-last ranks. Guarded each with
 #      `hasattr(self, "drafter")`, matching load_model's existing idiom. The
 #      runtime drafting paths needed nothing: execute_model already returns
 #      early on non-last ranks before reaching them.
 #   3. deepseek_mtp.py load_weights: under PP the proposer cannot share the
-#      target's embed_tokens (it lives on rank 0, the drafter on rank 7), and
+#      target's embed_tokens (it lives on rank 0, the drafter on the last rank), and
 #      the loader dropped the checkpoint's top-level embedding as a
 #      non-spec-layer weight -- leaving the draft on uninitialised embeddings.
 #      Now loaded explicitly when pp world_size > 1.
@@ -155,19 +132,9 @@ fi
 #
 # Verify correctness with mtp_verify.py: at temperature 0 speculation must be
 # token-identical to SPEC_TOKENS=0. Set SPEC_TOKENS=0 to disable.
-SPEC_TOKENS=${SPEC_TOKENS:-3}
 SPEC_ARGS=()
 if [ "$SPEC_TOKENS" -gt 0 ]; then
   SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC_TOKENS}")
-
-  # The drafter lives entirely on the LAST PP rank, so rank 7 pays for its own
-  # target layers *plus* the whole MTP module (a 256-expert MoE layer ~6 GiB and
-  # a 1.9 GiB embedding table, since under PP it cannot share the target's).
-  # With the default even split [9,10,10,10,10,10,10,9] that rank OOMs while
-  # loading the draft. Give it two fewer layers and hand them to rank 0, which
-  # is the lightest stage anyway -- its first 3 layers are dense, not MoE.
-  # Sums to 78 (num_hidden_layers).
-  export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-11,10,10,10,10,10,10,7}
 fi
 
 # Sync scheduling, as the gist uses. MTP+PP is made to work on this path by
@@ -177,7 +144,7 @@ fi
 # speculative decoding violates by construction.
 ASYNC_SCHED_ARG=${ASYNC_SCHED_ARG:---no-async-scheduling}
 
-# Loading the target and then the draft on rank 7 leaves the allocator badly
+# Loading the target and then the draft on the last rank can leave the allocator
 # fragmented -- the OOM there reported 6.74 GiB "reserved but unallocated".
 # Expandable segments let those reservations be reused instead of stranded.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -193,18 +160,18 @@ fi
 # Needs patch_fp8_kv.py, which adds the sm_80 reader -- Triton cannot name
 # fp8e4nv below sm_89, so the kernel decodes e4m3 out of raw bytes. The write
 # side is stock vLLM and already worked on Ampere.
-# On the binding rank (11 MLA layers + 5 indexer caches) this takes the total
-# from 13,332 to 7,876 B/token, so the same KV_CACHE_MEM holds 1.69x the
+# On the PP=12 binding ranks (7 MLA layers + 2 indexer caches) this takes the
+# total from 8,328 to 4,856 B/token, so the same KV_CACHE_MEM holds 1.71x the
 # tokens. The indexer caches are already fp8 and do not shrink.
 # DEFAULT fp8_ds_mla as of 2026-08-12. Needle 5/5 at 261,687 and 3/3 at
 # 1,040,056 tokens; costs ~7% on prefill and 2-5% on decode, and buys 1.69x
-# the KV tokens. Set KV_CACHE_DTYPE=auto for the bf16 cache (604,032 tokens
-# at the KV_CACHE_MEM above, so 2.30x at 262K instead of 4.00x).
+# the KV tokens. At the estimated 20 GiB PP=12 default, `auto` holds 2,578,624
+# slots while fp8_ds_mla holds 4,422,272 (before scheduler overhead).
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_ds_mla}
 
 # GLM52_LMHEAD_BITS: runtime lm_head quantization to Marlin WxA16 g64 at
 # load (patch_lmhead_quant.py). At k=3 MTP the shared lm_head is projected
-# 4x/step (7.6 GB of bf16 reads on rank 7's critical path). DEFAULT 8
+# 4x/step (7.6 GB of bf16 reads on the last rank's critical path). DEFAULT 8
 # (W8A16: 64.1 vs 65.9 ms/step, quality-lossless on greedy canaries).
 # 4 saves ~1.3 ms more but flipped a greedy code token (plain-RTN INT4 is
 # too coarse for lm_head); 0 disables.
@@ -227,6 +194,7 @@ KERNEL_ARGS=()
 KC=""
 [ -n "${MOE_BACKEND:-}" ] && KC="\"moe_backend\":\"$MOE_BACKEND\""
 if [ -n "${KERNEL_CFG_JSON:-}" ]; then KC="${KC:+$KC,}$KERNEL_CFG_JSON"; fi
+[ -n "$KC" ] && KERNEL_ARGS=(--kernel-config "{$KC}")
 
 # EAGER=1 skips ALL CUDA graph capture (boots ~9 min faster; decode ~2x
 # slower) -- use for crash-repro / debug restarts where perf is irrelevant.
@@ -321,17 +289,11 @@ export GLM52_PP_TOPK_RELAY=${GLM52_PP_TOPK_RELAY-1}
 # behind the long-context copy corruption (the first was topk tie-breaks).
 # Verified: with this on, fused_marlin_moe is bit-stable across repeated
 # calls, quiet and under transfer contention. Set 0 to restore the CUDA op.
-# GLM52_SPLIT_MOE (patch_split_moe.py + moe_gemv_marlin.cu): route DECODE tokens
-# through the deterministic per-row gemv instead of the fused Marlin MoE. THE FIX
-# (2026-09-08) for the co-flight decode corruption: the fused Marlin MoE is NOT
-# batch-composition-invariant -- a decode row co-batched with co-flight rows gets
-# a DRAMATICALLY wrong (not ULP) output because the GEMM tiling/reduction depends
-# on total token count M. Build-controlled A/B (same cached build): split OFF 50/72
-# co-flight flips, split ON 0/72. Throughput NEUTRAL-to-POSITIVE (single ~+10%: the
-# gemv beats the Marlin small-batch floor; prefill unaffected). Aug tested this
-# ("failed 2/7") but cross-boot build-lottery masked it -- see the same-boot A/B
-# harness in coflight_probe/. Set 0 to restore the stock fused MoE.
-export GLM52_SPLIT_MOE=${GLM52_SPLIT_MOE:-1}
+# GLM52_SPLIT_MOE=1 restores the experimental per-row GEMV decode path.
+# The later GLM-5.3 investigation measured ~40% lower throughput without
+# fixing corruption. Both launchers default to fused Marlin; keep the
+# router, norm, topk relay, and deterministic alignment fixes enabled.
+export GLM52_SPLIT_MOE=${GLM52_SPLIT_MOE:-0}
 
 export GLM52_MOE_ALIGN_DET=${GLM52_MOE_ALIGN_DET-1}
 
@@ -391,19 +353,30 @@ for _diag in GLM52_PP_TRIPWIRE GLM52_IDXVAL GLM52_PP_SPEC_GLOBAL_SER GLM52_PROF;
   fi
 done
 
-echo "config: PP=$PP spec=$SPEC_TOKENS decode_batch_cap=$GLM52_PP_DECODE_BATCH_CAP" \
+echo "config: PP=$PP TP=$TP world=$_world_size spec=$SPEC_TOKENS decode_batch_cap=$GLM52_PP_DECODE_BATCH_CAP" \
      "fullcg=$GLM52_DSA_FULLCG adaptive_cap=$GLM52_PP_DECODE_ADAPTIVE lmhead_bits=$GLM52_LMHEAD_BITS" \
      "max_len=${MAX_LEN:-409600} kv_bytes=${KV_CACHE_MEM:-unset}" \
      "kv_dtype=$KV_CACHE_DTYPE fullcg_maxlen=$GLM52_DSA_FULLCG_MAXLEN" \
      "relay=$GLM52_PP_TOPK_RELAY topk_det=$GLM52_TOPK_DET prefill_det=$GLM52_PREFILL_TOPK_DET" \
-     "moe_align_det=$GLM52_MOE_ALIGN_DET guard=$GLM52_CAP_PREFILL_GUARD" >&2
+     "moe_align_det=$GLM52_MOE_ALIGN_DET guard=$GLM52_CAP_PREFILL_GUARD split_moe=$GLM52_SPLIT_MOE" \
+     "partition=${VLLM_PP_LAYER_PARTITION:-auto}" >&2
+
+# The new budget exceeds the old kernel's signed 32-bit byte addressing.
+# Check the INSTALLED kernel, since editing the repository alone does not
+# update site-packages. Check profiled/custom budgets too.
+if [[ "$KV_CACHE_DTYPE" == fp8* ]]; then
+  if ! "$VENV/bin/python" -c 'from vllm._glm52_mla_fp8 import KV_ADDRESS_BITS; assert KV_ADDRESS_BITS >= 64'; then
+    echo "Install the updated FP8 kernel before serving: $VENV/bin/python $SCRIPT_DIR/patch_fp8_kv.py" >&2
+    exit 1
+  fi
+fi
 
 exec "$VENV/bin/vllm" serve "$MODEL" \
-  "${SPEC_ARGS[@]}" \
-  "${KV_ARGS[@]}" \
-  "${PROF_ARGS[@]}" \
-  "${KERNEL_ARGS[@]}" \
-  "${EAGER_ARGS[@]}" \
+  ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
+  ${KV_ARGS[@]+"${KV_ARGS[@]}"} \
+  ${PROF_ARGS[@]+"${PROF_ARGS[@]}"} \
+  ${KERNEL_ARGS[@]+"${KERNEL_ARGS[@]}"} \
+  ${EAGER_ARGS[@]+"${EAGER_ARGS[@]}"} \
   --served-model-name glm-5.2 \
   --pipeline-parallel-size "$PP" \
   --tensor-parallel-size "$TP" \

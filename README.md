@@ -1,14 +1,17 @@
 # vllm-170hx-glm5
 
-Serving **GLM-5.2** (753B DeepSeek-Sparse-Attention MoE, AWQ INT4 g64) on **8× NVIDIA CMP 170HX**
-(GA100, sm_80, 64 GB unlocked mining cards) with **vLLM 0.26.0**.
+Serving **GLM-5.2 and GLM-5.3** (753B DeepSeek-Sparse-Attention MoE, AWQ INT4 g64) on
+**12× NVIDIA CMP 170HX** (GA100, sm_80, 64 GB unlocked mining cards) with **vLLM 0.26.0**.
 
 Patches, custom Triton kernels, benchmarks and serving scripts. Everything here targets a
 configuration upstream does not support: DSA needs sparse-MLA kernels that only exist for
 Hopper/Blackwell, and sm_80 has no fp8 hardware at all.
 
-**Headline:** the full **1,048,576-token context** runs on this box, or 4 concurrent 262K
-streams, at 66–80 ms/step single-stream decode.
+**Twelve-card starting profile:** 20 GiB/rank of fp8 cache is estimated to provide
+**4,422,272 aggregate KV-token slots**, up from 2,653,376 with the previous 12 GiB budget
+(**+66.7%**). That is 10.80× 409,600-token or 16.87× 262,144-token capacity before scheduler
+reserves. The twelve-card profile has not been run on hardware yet; the original eight-card
+setup demonstrated the full **1,048,576-token per-request context**.
 
 ---
 
@@ -16,19 +19,29 @@ streams, at 66–80 ms/step single-stream decode.
 
 | | |
 |---|---|
-| GPUs | 8× CMP 170HX, GA100 sm_80, 70 SMs, 64 GB (unlocked) |
+| GPUs | 12× CMP 170HX, GA100 sm_80, 70 SMs, 64 GB (unlocked) |
 | Interconnect | PCIe gen2 x4 (~1.5 GB/s), no NVLink |
 | Measured HBM read | 1.70 TB/s |
 | Measured bf16 dense GEMM | 187 TFLOP/s (8192³) |
 
-PCIe gen2 x4 is the binding constraint: **use PP=8, never TP.** A PP hop ships one activation
+PCIe gen2 x4 is the binding constraint: **use PP=12, TP=1.** A PP hop ships one activation
 tensor per stage boundary (~0.1 ms); TP's per-layer all-reduces would dominate.
+
+The default layer partition is `6,7,7,7,7,7,7,7,7,6,6,4`. The final
+rank is deliberately three target layers lighter than a regular heavy stage because it also
+owns the complete MTP draft MoE, its private embedding, and the shared output head. Rank 0
+ends before full-indexer layer 6, avoiding a four-indexer cache and long-prefill hotspot.
+The same partition is retained with `SPEC_TOKENS=0` so turning speculation off does not
+change the cache bottleneck. Topology and memory defaults live in `glm_profile.sh`.
 
 ---
 
 ## Performance
 
-All numbers measured on the above box, vLLM 0.26.0, MTP k=3, fp8 KV cache, all patches applied.
+The numbers below are the measured **original 8-card baseline**, retained for regression
+comparison. The 12-card defaults are topology- and memory-derived and should be remeasured on
+the target host with `bench_matrix.py` before treating them as a performance claim. vLLM 0.26.0,
+MTP k=3, fp8 KV cache, and all patches were used for the baseline.
 Decode is reported as **ms/step** — tok/s swings with MTP acceptance (`min_tokens` forces
 generation past EOS and the filler is trivially predictable, which inflates acceptance), so
 step time is the stable metric.
@@ -57,18 +70,43 @@ per-token throughput roughly halves.
 | conc 8, 512 ctx | — | 154 |
 | conc 16, 512 ctx | — | 203 |
 
-4×192K holds 786K KV tokens, which does not fit without the fp8 cache (bf16 caps at 604K here).
+On the original eight-card layout, 4×192K did not fit without the fp8 cache. The twelve-card
+bf16 profile is estimated to provide 2,578,624 aggregate KV-token slots.
 
 ### KV cache capacity
 
-The binding PP rank carries 11 MLA layers + 5 indexer caches:
+The binding ranks in the twelve-stage MTP partition carry 7 MLA layers + 2 indexer caches:
 
-| dtype | bytes/token | KV tokens @ 7.69 GiB/rank |
-|---|---|---|
-| bf16 | 13,332 | 604,032 |
-| `fp8_ds_mla` | **7,876** | **1,048,576** |
+| dtype | bytes/token on binding rank | 12 GiB/rank | 20 GiB/rank (default) |
+|---|---|---|---|
+| bf16 | 8,328 | 1,547,136 | 2,578,624 |
+| `fp8_ds_mla` | **4,856** | **2,653,376** | **4,422,272** |
 
-fp8 costs ~7% on prefill and 2–5% on decode. Needle-in-haystack: **5/5 at 261,687 tokens**
+These are block-aligned estimates: `floor(bytes / (bytes_per_token × 64)) × 64`.
+The final stage's MTP cache is included in the check and does not bind. vLLM takes the
+smallest block count across PP ranks and shrinks the other allocations accordingly, so
+unused memory on a light rank cannot compensate for a full heavy rank. See the
+[v0.26.0 allocator](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/core/kv_cache_utils.py).
+The server's startup cache report is authoritative; null blocks, speculative lookahead,
+partial blocks and generation need headroom beyond the prompt working set.
+
+**Why 20 GiB:** the old tight middle stages owned ten MoE layers; the twelve-card split
+owns at most seven. At approximately 5 GiB of resident weights per layer, that frees
+about 15 GiB on those ranks. Increasing the original 7.69 GiB cache to 20 GiB uses
+12.31 GiB of this estimate, leaving a margin for graph capture and long-prefill transients.
+This is a sizing estimate from the old measurements, not an on-host memory profile.
+Use `KV_CACHE_MEM=12884901888` to restore the conservative 12 GiB budget, or
+`KV_CACHE_MEM="" GPU_UTIL=0.90` to profile automatically. A fixed budget bypasses vLLM's
+KV memory sizing; changing `GPU_UTIL` alone does not shrink it.
+
+**Required kernel update:** 4.42M slots put a single 656-byte MLA cache beyond 2 GiB.
+The reader now widens slot IDs to int64 **before** stride multiplication. Both launchers
+check `KV_ADDRESS_BITS` in the installed kernel, so a stale site-packages copy fails before
+loading the model. Re-run `patch_fp8_kv.py` after copying these sources. The GPU test
+`test_mla_fp8.py` exercises the reader and stock writer around the 2 GiB boundary and
+at the final slot, using a compact reference instead of decoding the entire pool.
+
+In the eight-card measurements, fp8 costs ~7% on prefill and 2–5% on decode. Needle-in-haystack: **5/5 at 261,687 tokens**
 and **3/3 at 1,040,056 tokens**.
 
 ---
@@ -93,7 +131,7 @@ declaring float16.
 
 | script | what it does |
 |---|---|
-| `patch_mtp_pp.py` | 15 patches making MTP speculative decoding work under PP=8 |
+| `patch_mtp_pp.py` | 15 patches making MTP speculative decoding work under pipeline parallelism |
 | `patch_fp8_kv.py` | `fp8_ds_mla` KV cache on sm_80 (+ skips a 3.5 GiB unreachable reserve so 1M fits) |
 | `patch_idx_prefill_v2.py` | query-blocked DSA prefill logits kernel, 1.28x, bit-exact |
 | `patch_mqa_v2.py` | rewritten DSA decode logits kernel, 2.8x |
@@ -173,17 +211,24 @@ drafter has been hijacked by the attr-sniffing trap (see the fourth writeup).
 ./start_glm53.sh          # GLM-5.3: same stack, same knobs (serve_glm53.sh / stop_glm53.sh)
 ```
 
-Defaults are the validated configuration: PP=8, MTP k=3, fp8 KV, 409,600 context at 2.56x
-concurrency. Override with env vars:
+Defaults are the twelve-card topology profile: PP=12, TP=1, MTP k=3, fp8 KV, 409,600 context
+at an estimated 10.80x cache capacity. The router/norm/topk correctness fixes remain enabled;
+both launchers now default to fused Marlin (`GLM52_SPLIT_MOE=0`), matching the later GLM-5.3
+findings. The new partition, cache size, kernel addressing and adaptive threshold require
+on-host validation.
+Override with env vars:
 
 | env | default | |
 |---|---|---|
-| `MAX_LEN` | `409600` | `262144` for 4.00x concurrency; `1048576` for the full 1M context (1.00x concurrency, ~10 min TTFT) |
+| `PP` / `TP` | `12` / `1` | built-in PP=8 fallback; TP=1 required by this profile |
+| `CUDA_VISIBLE_DEVICES` | `0,...,PP-1` | derives from PP; duplicate, empty and mismatched lists are rejected |
+| `VLLM_PP_LAYER_PARTITION` | `6,7,7,7,7,7,7,7,7,6,6,4` | MTP/indexer-aware 78-layer split; validated for entry count and sum at launch |
+| `MAX_LEN` | `409600` | `262144` gives an estimated 16.87x cache capacity; `1048576` enables the full per-request context |
 | `KV_CACHE_DTYPE` | `fp8_ds_mla` | `auto` for the bf16 cache |
-| `KV_CACHE_MEM` | `8258584576` | bytes/rank; this value gives exactly 1,048,576 KV tokens |
+| `KV_CACHE_MEM` | `21474836480` | 20 GiB/rank estimate for the built-in PP=12 split; empty uses `GPU_UTIL`; custom partitions default to profiling |
 | `SPEC_TOKENS` | `3` | `0` disables MTP |
 | `GLM52_PP_DECODE_BATCH_CAP` | `2` | decodes per scheduled batch |
-| `GLM52_PP_DECODE_ADAPTIVE` | `8` | below this many decoders, drop the cap to 1; `0` disables |
+| `GLM52_PP_DECODE_ADAPTIVE` | `12` | below this many decoders, drop the cap to 1; defaults to `PP`, `0` disables |
 | `GLM52_DSA_FULLCG_MAXLEN` | `0` | `2048` restores the (redundant) piecewise gate |
 | `GLM52_GATE_FP32` | `1` | fp32 MoE router logits; `0` = stock bf16 fallback (garbage tokens at long context) |
 | `GLM52_ROUTER_FIX` | `router_fix_glm5x_s.pt` | AWQ fold compensation for the router/indexer; build the file with `make_router_fix.py`; empty disables |
@@ -192,6 +237,26 @@ concurrency. Override with env vars:
 
 Every knob is echoed in a `config:` line at boot, and the script warns loudly if a diagnostic
 env (`GLM52_PROF`, `GLM52_IDXVAL`, tripwire) is left set.
+
+### Validate the twelve-card profile on the host
+
+Keep the updated source files together, including `glm_profile.sh`. In the serving venv:
+
+```bash
+python patch_fp8_kv.py       # installs the 64-bit reader; existing patch anchors are idempotent
+python test_mla_fp8.py       # GPU numerical checks, including >2 GiB writer/reader addresses
+python -m unittest -v test_launch_profiles  # CPU-only launcher and benchmark checks
+./start_glm53.sh
+python bench_glm52.py --model glm-5.3
+python bench_matrix.py --model glm-5.3 --only conc
+```
+
+Check the boot log's KV capacity and each GPU's free memory, then run the existing
+needle/copy-fidelity probes and the concurrent benchmark before treating 20 GiB as validated.
+The default matrix skips its 1M case on a 409,600-token server. To test that case, restart
+with `MAX_LEN=1048576` and pass `--max-model-len 1048576` to `bench_matrix.py`.
+Both benchmarks accept `--base-url`; use `--model glm-5.2` for the other launcher. Request
+failures now fail the benchmark rather than reporting throughput from a partial workload.
 
 ### Two settings that silently cost ~1.7x
 
@@ -243,9 +308,12 @@ Both were found by measurement, not by reading code, and both look fine in the l
 - **MoE is the remaining decode bottleneck.** Marlin WNA16 is ~42% of GPU kernel time and runs
   at 49% of the memory roof at conc=8 shapes. A perfect replacement is worth ~1.27x overall;
   the GEMV attempt here reached only 0.30x of Marlin and is not wired in.
-- **Concurrency tops out around 2x single-stream at 4 streams**, because 4 groups fill only half
-  of the 8-stage pipeline.
-- Paths in the scripts are absolute and specific to this box; edit before use.
+- Low-concurrency workloads cannot fill a twelve-stage pipeline. At decode cap=2, use
+  24 distinct decoding requests to provide 12 groups. `bench_matrix.py` defaults to
+  24 × 128K (3.15M prompt tokens, within the estimated 4.42M fp8 pool); the adaptive
+  cap uses one request per group below 12 decoders.
+- Model, router-fix and cache paths are specific to the original box; override them before
+  use elsewhere. `VLLM_INSTALL_DIR` and `VENV` relocate the serving runtime.
 
 ## License
 

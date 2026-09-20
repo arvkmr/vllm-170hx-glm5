@@ -3,10 +3,10 @@
 # for it to come up. Companion to stop_glm53.sh; the actual vllm invocation
 # and all config live in serve_glm53.sh.
 #
-# Defaults are the validated config: 409600 max-model-len (400K per stream),
-# 7.69 GiB/rank fp8_ds_mla KV (1,048,576 KV tokens, 2.56x concurrency at full
-# context), MTP k=3, hybrid full cudagraphs, PP topk relay + canonical topk +
-# deterministic moe_align. Env knobs (all pass through to serve script):
+# Defaults target 12 cards: PP=12, 409600 max-model-len (400K per stream),
+# 20 GiB/rank fp8_ds_mla KV (estimated 4,422,272 slots, 10.80x capacity at
+# full context), MTP k=3, hybrid full cudagraphs, PP topk relay + canonical
+# topk + deterministic moe_align. Env knobs (all pass through to serve script):
 #   SPEC_TOKENS=0            disable MTP speculative decoding
 #   MAX_LEN=32768            shorter context
 #   KV_CACHE_MEM=""          use GPU_UTIL fraction instead of fixed KV budget
@@ -17,7 +17,11 @@
 # Cold start is ~10 min: ~2 min weight load (warm NFS cache) + 33 CUDA graph
 # captures at ~17 s each.
 set -euo pipefail
-cd /home/user/vllm_install
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Reject invalid topology before detaching or waiting through a model load.
+source "$SCRIPT_DIR/glm_profile.sh"
+export VLLM_INSTALL_DIR=${VLLM_INSTALL_DIR:-/home/user/vllm_install}
+cd "$VLLM_INSTALL_DIR"
 
 if pgrep -f '[b]in/vllm serve' > /dev/null; then
   echo "vllm serve is already running (pid $(pgrep -f '[b]in/vllm serve' | head -1))." >&2
@@ -36,7 +40,7 @@ fi
 
 mkdir -p logs
 LOG=${LOG:-logs/glm53.$(date +%Y%m%d-%H%M%S).log}
-setsid nohup ./serve_glm53.sh > "$LOG" 2>&1 < /dev/null &
+setsid nohup "$SCRIPT_DIR/serve_glm53.sh" > "$LOG" 2>&1 < /dev/null &
 disown
 ln -sf "$(basename "$LOG")" logs/glm53.latest.log
 echo "launched; log: $LOG (symlinked as logs/glm53.latest.log)"
@@ -47,10 +51,10 @@ fi
 
 echo -n "waiting for health (warm start ~10 min; first boot with cold compile cache ~20 min)"
 for _ in $(seq 1 180); do
-  if curl -s -m 2 localhost:8000/health > /dev/null 2>&1; then
+  if curl -fsS -m 2 "http://localhost:${PORT:-8000}/health" > /dev/null 2>&1; then
     echo
     echo "server healthy."
-    grep -hE "KV cache size|Maximum concurrency" "$LOG" | tail -2
+    grep -hE "KV cache size|Maximum concurrency" "$LOG" | tail -2 || true
     exit 0
   fi
   if ! pgrep -f '[b]in/vllm serve' > /dev/null; then

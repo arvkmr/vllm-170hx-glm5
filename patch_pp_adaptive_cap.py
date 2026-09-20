@@ -2,7 +2,7 @@
 """Make the PP decode batch cap adapt to how many requests are decoding.
 
 GLM52_PP_DECODE_BATCH_CAP splits ready decodes into groups so they pipeline
-across the 8 PP stages instead of forming one lockstep batch. The right cap is
+across the PP stages instead of forming one lockstep batch. The right cap is
 not a constant: it trades pipeline depth (favours a small cap -- more groups)
 against MoE batch efficiency (favours a large cap -- Marlin is barely cheaper
 per token at 4 rows than at 8, so bigger batches amortise its fixed floor).
@@ -17,10 +17,10 @@ length. Measured this box, fp8, gate off, aggregate decode tok/s:
     4 x 64K             90.8   100.3
     4 x 192K            45.8    67.7
 
-Below ~8 decoding requests there are too few groups to fill an 8-stage pipe,
-so cap=1 wins (up to +48% at 4x192K -- exactly the long-context concurrency
-the fp8 KV work unlocked). At 8+ requests there are already enough groups and
-the larger batch wins instead.
+On the original PP=8 measurements, below ~8 decoding requests there were too
+few groups to fill the pipe, so cap=1 won (up to +48% at 4x192K). At 8+
+requests the larger batch won instead. The serve scripts use the PP size as
+the threshold, making the topology-derived default 12 on the twelve-card box.
 
 So: cap 1 while fewer than GLM52_PP_DECODE_ADAPTIVE requests are decoding,
 otherwise the configured GLM52_PP_DECODE_BATCH_CAP. Set

@@ -19,15 +19,16 @@ that actually stresses KV capacity.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import random
 import re
-import threading
 import time
 import urllib.request
 
 BASE = "http://localhost:8000"
 URL = f"{BASE}/v1/chat/completions"
+MODEL = "glm-5.2"
 
 WORDS = (
     "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
@@ -70,7 +71,7 @@ def spec_counters():
 def stream_once(prompt, gen, out):
     """Stream one completion; append (ttft, decode_s, prompt_tok, gen_tok) to out."""
     body = json.dumps({
-        "model": "glm-5.2",
+        "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": gen,
         "min_tokens": gen,
@@ -107,6 +108,20 @@ def stream_once(prompt, gen, out):
     ))
 
 
+def parallel_requests(prompts, gen, stagger):
+    results = []
+    with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+        futures = []
+        for prompt in prompts:
+            futures.append(pool.submit(stream_once, prompt, gen, results))
+            time.sleep(stagger)
+        # Worker errors must fail the benchmark: a partial set of responses
+        # does not measure the requested concurrency or KV working set.
+        for future in futures:
+            future.result()
+    return results
+
+
 def run_case(label, ctx, streams, gen, salt):
     """Prefill + decode for `streams` distinct contexts of `ctx` tokens.
 
@@ -121,29 +136,15 @@ def run_case(label, ctx, streams, gen, salt):
     prompts = [build_prompt(ctx, f"{salt}-{ctx}-{i}") for i in range(streams)]
 
     # -- pass 1: prefill only, concurrent, gen=1
-    warm, threads = [], []
     t0 = time.time()
-    for p in prompts:
-        t = threading.Thread(target=stream_once, args=(p, 1, warm))
-        t.start()
-        threads.append(t)
-        time.sleep(0.3)
-    for t in threads:
-        t.join()
+    warm = parallel_requests(prompts, 1, 0.3)
     prefill_wall = time.time() - t0
     ptoks = sum(r[2] for r in warm) if warm else 0
 
     # -- pass 2: decode, prefill now cache-hot
     before = spec_counters()
-    results, threads = [], []
     t0 = time.time()
-    for p in prompts:
-        t = threading.Thread(target=stream_once, args=(p, gen, results))
-        t.start()
-        threads.append(t)
-        time.sleep(0.05)
-    for t in threads:
-        t.join()
+    results = parallel_requests(prompts, gen, 0.05)
     wall = time.time() - t0
     after = spec_counters()
 
@@ -154,7 +155,7 @@ def run_case(label, ctx, streams, gen, salt):
     gtoks = sum(r[3] for r in results)
 
     steps = acc = None
-    if before and after and before[0] is not None and after[0] is not None:
+    if before and after and all(x is not None for x in (*before, *after)):
         steps = after[0] - before[0]
         dtok = after[1] - before[1]
         atok = after[2] - before[2]
@@ -177,21 +178,37 @@ def run_case(label, ctx, streams, gen, salt):
 
 
 def main():
+    global BASE, URL, MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["single", "conc"], default=None)
     ap.add_argument("--gen", type=int, default=128)
     ap.add_argument("--salt", default="m1")
-    ap.add_argument("--conc-ctx", type=int, default=196608)
-    ap.add_argument("--conc-n", type=int, default=4)
+    ap.add_argument("--model", default="glm-5.2", help="Use glm-5.3 for that launcher")
+    ap.add_argument("--base-url", default=BASE)
+    ap.add_argument("--max-model-len", type=int, default=409600,
+                    help="Match MAX_LEN at server launch; larger cases are skipped")
+    # At cap=2, 24 decoders provide 12 groups for the twelve-stage pipe.
+    # 24 * 128K = 3.15M prompt tokens fits the estimated 4.42M fp8 slots.
+    ap.add_argument("--conc-ctx", type=int, default=131072)
+    ap.add_argument("--conc-n", type=int, default=24)
     ap.add_argument("--single-ctx", default="32768,262144,1048576")
     a = ap.parse_args()
+    BASE, MODEL = a.base_url.rstrip("/"), a.model
+    URL = f"{BASE}/v1/chat/completions"
+    if min(a.gen, a.conc_ctx, a.conc_n) <= 0 or a.max_model_len <= a.gen + 64:
+        ap.error("generation, concurrency and context must be positive and fit max-model-len")
+    if a.only != "single" and a.conc_ctx + a.gen + 64 > a.max_model_len:
+        ap.error("concurrent context plus generation exceeds max-model-len")
 
     rows = []
     if a.only != "conc":
         print("single stream (prefill uncached, then decode at that context):")
         for ctx in [int(x) for x in a.single_ctx.split(",")]:
+            if ctx > a.max_model_len:
+                print(f"  {ctx // 1024}K skipped (server max-model-len={a.max_model_len})")
+                continue
             # Leave room for generation inside max_model_len.
-            r = run_case(f"{ctx // 1024}K x1", min(ctx, 1048576 - a.gen - 64),
+            r = run_case(f"{ctx // 1024}K x1", min(ctx, a.max_model_len - a.gen - 64),
                          1, a.gen, a.salt)
             rows.append(r)
 

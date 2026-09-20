@@ -3,7 +3,7 @@
 
 Copies _glm52_moe_split.py + the GEMV kernel sources into site-packages/vllm
 and hooks MarlinExperts.apply via an install call appended to marlin_moe.py.
-Pre-builds the CUDA extension so the 8 PP ranks load a cached .so instead of
+Pre-builds the CUDA extension so all PP ranks load a cached .so instead of
 racing the first compile at server start.
 
 Env: GLM52_SPLIT_MOE=1 enables the dispatch (default 0 until validated).

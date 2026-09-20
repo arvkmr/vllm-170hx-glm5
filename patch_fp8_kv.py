@@ -11,10 +11,11 @@ missing was a *reader*: Triton cannot name `fp8e4nv` below sm_89, so the
 attention kernel had to decode e4m3 from raw bytes. That lives in
 glm52_mla_fp8.py, installed here as vllm/_glm52_mla_fp8.py.
 
-Capacity on this box (11 MLA layers + 5 indexer caches on the binding rank):
-13,332 -> 7,876 bytes/token, so the same 6.57 GiB/rank holds 529,024 ->
-895,488 KV tokens, a 1.69x gain. The MLA cache itself drops 1.76x (1152 ->
-656); the indexer caches are already fp8 and do not move.
+Capacity with the default twelve-stage MTP partition (7 MLA layers + 2
+indexer caches on the binding ranks): 8,328 -> 4,856 bytes/token. The default
+20 GiB/rank reservation is estimated to hold 2,578,624 -> 4,422,272 block-aligned
+KV tokens, a 1.71x gain. The MLA cache itself drops 1.76x (1152 -> 656); the
+indexer caches are already fp8 and do not move.
 
 Enable with `--kv-cache-dtype fp8_ds_mla` (or `fp8`, which canonicalizes to
 it). GLM52_MLA_FP8=0 forces the bf16 kernel back even when the cache is fp8,
@@ -30,7 +31,7 @@ import vllm
 
 VLLM = os.path.dirname(vllm.__file__)
 BACKUP = os.path.join(os.path.dirname(VLLM), ".glm52-backup", "vllm")
-SRC = "/home/user/vllm_install/glm52_mla_fp8.py"
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glm52_mla_fp8.py")
 DST = os.path.join(VLLM, "_glm52_mla_fp8.py")
 
 TMS = "v1/attention/backends/mla/triton_mla_sparse.py"

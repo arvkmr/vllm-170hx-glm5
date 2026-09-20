@@ -3,13 +3,14 @@
 
 Why: at k=3 MTP every decode step projects hidden states through the FULL
 154880x6144 bf16 lm_head FOUR times (target verify + 3 drafter iterations;
-the drafter shares the target's lm_head object), reading 7.6 GB/step at 97%
-of HBM bandwidth on rank 7's critical path -- 4.6 ms of the 65.9 ms step.
+the drafter shares the target's lm_head object). On the original PP=8 layout,
+that read 7.6 GB/step at 97% of HBM bandwidth on the last rank's critical path
+-- 4.6 ms of the 65.9 ms step.
 The checkpoint keeps lm_head unquantized (compressed-tensors ignore list).
 
 Fix: quantize lm_head to Marlin W4A16 (or W8A16) AT LOAD TIME, in place, on
 whichever rank owns it. Measured on the real weight: 1.171 -> 0.448 ms per
-projection (INT4 g64), ~2.9 ms/step total, and frees ~1.4 GB on rank 7.
+projection (INT4 g64), ~2.9 ms/step total, and frees ~1.4 GB on the last rank.
 Swapping `lm_head.quant_method` covers all four uses because the drafter's
 shared_head.head IS the same module object (_maybe_share_lm_head).
 
