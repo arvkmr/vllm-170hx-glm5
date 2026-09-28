@@ -16,7 +16,43 @@ lacks for this target on Ampere.
 | KV cache | packed `fp8_ds_mla` (656 B/token/layer) + fp8 indexer keys, block 128 |
 | Context | 1,048,576 tokens; ~1.87M tokens of KV reported (2.09M pool) |
 | Speculation | DFlash2, k=7, ~3.5-3.9 accepted tokens/step |
-| Decode | ~85-89 ms/step, ~41-44 tok/s single stream (FULL decode graphs) |
+| Decode | ~90-94 ms/step, ~39-41 tok/s single stream (FULL decode graphs); 152 tok/s aggregate at 8 streams |
+| Prefill | ~1.8-2.0K tok/s for one 8K prompt, ~2.4K tok/s at 32K or 8 concurrent |
+
+## Performance
+
+Measured 2026-09-28 on the `agent` profile (10 cards; the core profile
+applies +250 MHz VF offset and a 1350 MHz SM ceiling, with 1300 MHz on the one
+marginal card; 180 W power cap). C8 needs 8 seats, so every row was measured
+with `MAX_SEQS=8`. That leaves 1,832,659 KV tokens against 1,874,240 at the
+default 4 seats. C1 and C4 matched the default profile within 4%.
+
+Decode: C concurrent greedy streams, 512 tokens each (`ignore_eos`), a
+different prompt per stream (prose, code, technical). Prefill: C concurrent
+requests of ~7.8K unique prompt tokens (no prefix-cache hits), `max_tokens=1`.
+
+| Concurrency | Per-stream decode | Aggregate decode | Spec tokens/step | Prefill TTFT mean / max | Aggregate prefill |
+|---|---|---|---|---|---|
+| C1 | 39.7 tok/s | 39.2 tok/s | 3.55 | 4.3 s / 4.3 s | 1,836 tok/s |
+| C4 | 29.0 tok/s (min 26.4) | 102.1 tok/s | 3.47 | 9.9 s / 14.6 s | 2,140 tok/s |
+| C8 | 22.5 tok/s (min 20.0) | 152.2 tok/s | 3.21 | 15.1 s / 25.5 s | 2,460 tok/s |
+
+A single 31K-token prompt prefills in 13.1 s (2,386 tok/s). Prefill is
+chunked at `max_num_batched_tokens=512` through a 10-stage pipeline, so it
+gains only ~25-35% from concurrency. Decode throughput scales with
+concurrency. Speculative acceptance dips slightly as streams are added.
+
+Reproduce with `bench_conc.py` against a running server:
+
+```bash
+MAX_SEQS=8 PROFILE=agent ./start.sh
+python3 bench_conc.py 8000 decode 8 512     # C8 decode
+python3 bench_conc.py 8000 prefill 8 8192   # C8 prefill
+```
+
+The default `agent` profile (4 seats) measured C1 39.6 tok/s decode and
+1,973 tok/s prefill, and C4 98.1 tok/s aggregate decode and 2,227 tok/s
+prefill. Those are within run-to-run noise of the rows above.
 
 ## What the patches do
 
