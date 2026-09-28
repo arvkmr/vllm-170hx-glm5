@@ -1,47 +1,19 @@
 # ALLOWLIST, not a denylist. Everything is ignored by default and only source
-# is re-included, so a new artifact directory can never be committed by
-# accident. This matters here: profiles/ holds nsys reports (binary, and nsys
-# captures the process environment), coredumps/ holds raw process memory, and
-# logs/ holds full command lines -- any of which can carry an HF_TOKEN or
-# similar. Git does not descend into an ignored directory, so the negations
-# below only ever re-include files at the repo root.
+# is re-included, so runtime artifacts (logs/ holds full command lines, which
+# can carry tokens) can never be committed by accident. Git does not descend
+# into an ignored directory, so these negations only re-include root files.
 *
 
 !.gitignore
 !README.md
-!upstream_writeup_*.md
 !*.py
 !*.sh
-!*.cu
-!*.cpp
+!*.env
+!*.service
 
 # Belt and braces: named explicitly so they stay out even if the rules above
 # are ever loosened to allow subdirectories.
-.venv/
 logs/
-profiles/
-dumps/
-coredumps/
-.vllm_cache/
+cache/
 __pycache__/
-.claude/
-*.nsys-rep
-*.sqlite
-*.json
-*.log
-*.pt
-*.safetensors
-
-# Local only -- deliberately NOT published. Hardware bring-up diagnostics from
-# the CMP 170HX 64 GB unlock / Xid 31 investigation, and the MiniMax-M2.7
-# setup that shares this box. Neither is part of serving GLM-5.2.
-alloc_pattern_test.py
-ce_coverage_test.py
-gpu_stress.py
-hbm_soak.py
-mmap_load_test.py
-real_alloc_test.py
-nccl_pp_test.py
-bench.py
-copy_model.sh
-serve_minimax.sh
+.DS_Store

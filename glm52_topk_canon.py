@@ -54,11 +54,15 @@ def _topk_canon_kernel(
     sel = tl.load(sel_ptr + row * stride_sel_row + offs_k, mask=kmask, other=-1)
 
     if L <= K:
-        # Identity-shortcut rows: pass the kernel output through untouched.
-        tl.store(out_ptr + row * stride_out_row + offs_k, sel, mask=kmask)
+        # Identity-shortcut rows: emit 0..L-1 then -1 explicitly. This is
+        # persistent_topk's output; topKPerRowDecode returns the same set in
+        # an unstable order.
+        ident = tl.where(offs_k < L, offs_k, -1)
+        tl.store(out_ptr + row * stride_out_row + offs_k, ident, mask=kmask)
         return
 
-    valid = kmask & (sel >= 0)
+    # Only in-window entries count (see the prefill kernel).
+    valid = kmask & (sel >= 0) & (sel < L)
     ssc = tl.load(
         logits_ptr + row * stride_l_row + tl.where(valid, sel, 0),
         mask=valid,
@@ -93,6 +97,18 @@ def _topk_canon_kernel(
         )
         filled += tl.sum(eq.to(tl.int32))
         start += BLOCK_N
+
+    # Canonical ORDER too (index ascending). The score > v* entries above
+    # keep the input kernel's order, which is not stable call to call for
+    # either persistent_topk or topKPerRowDecode; sparse MLA accumulates in
+    # index-list order, so an unstable order is ULP-level nondeterminism.
+    tl.debug_barrier()
+    row_out = out_ptr + row * stride_out_row + offs_k
+    v = tl.load(row_out, mask=kmask, other=2147483647)
+    # Unfilled slots (-1) sort last, keeping the -1 pad at the row end.
+    v = tl.where(v < 0, 2147483647, v)
+    v = tl.sort(v)
+    tl.store(row_out, tl.where(v == 2147483647, -1, v), mask=kmask)
 
 
 @triton.jit
@@ -139,7 +155,9 @@ def _topk_canon_prefill_kernel(
     # sel holds the NATIVE kernel's output: indices RELATIVE to ks.
     # Work in absolute coordinates internally; the wrapper re-relativizes.
     sel = tl.load(sel_ptr + row * stride_sel_row + offs_k, mask=kmask, other=-1)
-    valid = kmask & (sel >= 0)
+    # Only in-window native entries count; anything else (pad, or a stale /
+    # out-of-window value) is ignored rather than trusted as an index.
+    valid = kmask & (sel >= 0) & (sel < nv)
     sel_abs = tl.where(valid, sel + ks, 0)
     ssc = tl.load(
         logits_ptr + row * stride_l_row + sel_abs,
@@ -198,7 +216,10 @@ def canon_topk_indices_prefill(
         return
     k = min(k, logits.shape[1])
     sel = topk_indices[:, :k]
-    out = torch.empty_like(sel)
+    # -1 (pad), not uninitialized memory: a slot the rebuild does not fill must
+    # read as "no token", never as a garbage index (vNext 2026-09-28: an
+    # out-of-range garbage slot crashed the gather below on a 57K prompt).
+    out = torch.full_like(sel, -1)
     _topk_canon_prefill_kernel[(rows,)](
         logits,
         sel,
@@ -244,12 +265,14 @@ def canon_topk_indices(
     """Replace topk_indices with the canonical (score desc, index asc) set.
 
     Assumes topk_indices came from a value-exact topk over logits[:, :seq].
-    Rows with seq_len <= K are passed through unchanged (identity shortcut).
+    Rows with seq_len <= K get the identity shortcut 0..L-1, -1 padded.
+    Output is canonical in set AND order (index ascending), independent of
+    which top-k kernel produced the input.
     """
     rows, k = topk_indices.shape
     if rows == 0:
         return
-    out = torch.empty_like(topk_indices)
+    out = torch.full_like(topk_indices, -1)  # never expose uninitialized slots
     _topk_canon_kernel[(rows,)](
         logits,
         topk_indices,

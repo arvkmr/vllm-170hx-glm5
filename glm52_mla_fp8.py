@@ -131,6 +131,20 @@ _SPLIT_AUTOTUNE_CONFIGS = [
     for ns in (2, 4)
 ]
 
+# Pin one config per kernel unless GLM52_MLA_AUTOTUNE=1. Warmup autotuning of
+# these ~0.1 ms decode calls is launch-noise dominated, so the pick changed
+# from boot to boot: measured on CMP 170HX under CUDA-graph replay, the split
+# kernel spans 77-108 us at 4 rows (~2 ms per PP10 MTP step between picks),
+# and the final kernel 2-5x at prefill shapes. Different BLOCK_N also changes
+# the accumulation order, so an unpinned boot is not bit-reproducible. The
+# pinned configs were fastest (or within 4%) at every measured shape: split
+# 1-32 rows, final 256-1024 rows with and without -1 tails.
+import os as _os
+
+if _os.environ.get("GLM52_MLA_AUTOTUNE", "0") != "1":
+    _FINAL_AUTOTUNE_CONFIGS = [triton.Config({"BLOCK_N": 16}, num_warps=2, num_stages=2)]
+    _SPLIT_AUTOTUNE_CONFIGS = [triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2)]
+
 KV_SPLITS_CANDIDATES = (1, 2, 4, 8, 16)
 _MIN_TOPK_PER_SPLIT = 128
 _SPLIT_MAX_OCCUPANCY = 4
@@ -204,6 +218,8 @@ def _sparse_mla_compute_tile_fp8(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP16: tl.constexpr,
+    IDX_SPAN: tl.constexpr,
+    TRIM_TAIL: tl.constexpr,
 ):
     """fp8_ds_mla twin of `_sparse_mla_compute_tile`.
 
@@ -241,7 +257,32 @@ def _sparse_mla_compute_tile_fp8(
     acc2 = tl.zeros([BLOCK_H, K_GROUP], dtype=tl.float32)
     acc3 = tl.zeros([BLOCK_H, K_GROUP], dtype=tl.float32)
 
-    for start_indice in range(split_start, split_end, BLOCK_N):
+    # Stop after the last valid index. Prefill rows shorter than topk carry a
+    # -1 tail (a token at position p has only p+1 valid entries of 2048) and
+    # computing those tiles dominated short-prompt TTFT. Only the trailing
+    # run is trimmed, so the loop body -- and its software pipelining -- is
+    # unchanged. A fully masked tile leaves acc and e_max bit-for-bit as they
+    # were; its one effect is e_sum += BLOCK_N while no valid key has been
+    # seen (p = exp2(0) = 1), which is replayed after the loop so that
+    # all-masked splits still emit their finite lse.
+    # TRIM_TAIL is on only for the single-pass kernel (prefill chunks); the
+    # split-KV decode path keeps the original loop, where the extra index
+    # scan cost ~5 us per call at 4 rows.
+    valid_end = split_end
+    if TRIM_TAIL:
+        offs_span = split_start + tl.arange(0, IDX_SPAN)
+        span_idx = tl.load(
+            indices_ptr
+            + cur_q * stride_indices_token
+            + cur_kv_head_id * stride_indices_head
+            + offs_span,
+            mask=offs_span < split_end,
+            other=-1,
+        )
+        span_ok = (span_idx >= 0) & (span_idx < seq_kv)
+        valid_end = tl.max(tl.where(span_ok, offs_span + 1, split_start), axis=0)
+
+    for start_indice in range(split_start, valid_end, BLOCK_N):
         offs_indice = start_indice + tl.arange(0, BLOCK_N)
         mask_indice = offs_indice < split_end
         indices = tl.load(
@@ -253,9 +294,9 @@ def _sparse_mla_compute_tile_fp8(
             other=-1,
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
-        # Widen BEFORE multiplying by the entry stride. The 20 GiB/rank
-        # profile has 4.42M slots: its per-layer byte offsets exceed INT32_MAX
-        # even though the slot IDs themselves still fit in int32.
+        # Widen BEFORE multiplying by the entry stride. A larger KV budget
+        # can put one 656-byte MLA cache beyond INT32_MAX bytes even though
+        # its slot IDs still fit in int32.
         safe_idx = tl.where(mask_kv, indices, 0).to(tl.int64)
 
         # Group scales: [BLOCK_N] each, with the fp16-decode bias folded in.
@@ -306,6 +347,13 @@ def _sparse_mla_compute_tile_fp8(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
+    if TRIM_TAIL:
+        skipped_tiles = tl.cdiv(split_end - split_start, BLOCK_N) - tl.cdiv(
+            valid_end - split_start, BLOCK_N
+        )
+        e_sum += tl.where(
+            e_max == NEG_LARGE, (skipped_tiles * BLOCK_N).to(tl.float32), 0.0
+        )
     return acc0, acc1, acc2, acc3, e_max, e_sum
 
 
@@ -332,6 +380,7 @@ def _sparse_mla_fp8_kernel_final(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP16: tl.constexpr,
+    IDX_SPAN: tl.constexpr,  # pow2 >= the index span one program covers
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -363,6 +412,8 @@ def _sparse_mla_fp8_kernel_final(
         BLOCK_H,
         BLOCK_N,
         IS_FP16,
+        IDX_SPAN,
+        True,
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 -> NaN from 0/0).
@@ -408,6 +459,7 @@ def _sparse_mla_fp8_kernel_split(
     BLOCK_N: tl.constexpr,
     LOGE2: tl.constexpr,
     IS_FP16: tl.constexpr,
+    IDX_SPAN: tl.constexpr,  # pow2 >= the index span one program covers
 ):
     """Stage 1 of split-KV: one slice of the topk axis -> (out, lse) partials."""
     cur_q = tl.program_id(0)
@@ -444,6 +496,8 @@ def _sparse_mla_fp8_kernel_split(
         BLOCK_H,
         BLOCK_N,
         IS_FP16,
+        IDX_SPAN,
+        False,
     )
 
     # When a split has no valid KV (`e_sum == 0`), guard the divide so the mid
@@ -473,6 +527,83 @@ def _sparse_mla_fp8_kernel_split(
         + K_DV
     )
     tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2, mask=mask_h)
+
+
+@triton.jit
+def _sparse_mla_fp8_merge_kernel(
+    mid_out_ptr,
+    out_ptr,
+    h_q,
+    stride_mid_token,
+    stride_mid_head,
+    stride_mid_split,
+    stride_out_token,
+    stride_out_head,
+    NUM_KV_SPLITS: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DV_TILE: tl.constexpr,
+    IS_FP16: tl.constexpr,
+):
+    """Merge split-KV partials without depending on vLLM-private helpers.
+
+    The old installer reused ``triton_mla_sparse_kernel``'s merge kernel. That
+    module was removed after the Ampere backend adopted the newer fused-merge
+    implementation, so keeping the small dtype-agnostic merge here lets the
+    validated packed-fp8 reader work on both vLLM 0.26 and the pinned vNext
+    fork.
+    """
+    cur_q = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_dv_tile = tl.program_id(2)
+
+    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
+
+    offs_dv = cur_dv_tile * BLOCK_DV_TILE + tl.arange(0, BLOCK_DV_TILE)
+    mask_dv = offs_dv < BLOCK_DV
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - 1.0e30
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV_TILE], dtype=tl.float32)
+
+    mid_base_2d = (
+        mid_out_ptr + cur_q * stride_mid_token + cur_head[:, None] * stride_mid_head
+    )
+    mid_lse_1d = (
+        mid_out_ptr + cur_q * stride_mid_token + cur_head * stride_mid_head + BLOCK_DV
+    )
+
+    for split_kv_id in range(NUM_KV_SPLITS):
+        tv = tl.load(
+            mid_base_2d + split_kv_id * stride_mid_split + offs_dv[None, :],
+            mask=mask_h[:, None] & mask_dv[None, :],
+            other=0.0,
+        )
+        tlogic = tl.load(
+            mid_lse_1d + split_kv_id * stride_mid_split,
+            mask=mask_h,
+            other=-float("inf"),
+        )
+        n_e_max = tl.maximum(tlogic, e_max)
+        old_scale = tl.exp(e_max - n_e_max)
+        exp_logic = tl.exp(tlogic - n_e_max)
+        acc = acc * old_scale[:, None] + exp_logic[:, None] * tv
+        e_sum = e_sum * old_scale + exp_logic
+        e_max = n_e_max
+
+    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    tl.store(
+        out_ptr
+        + cur_q * stride_out_token
+        + cur_head[:, None] * stride_out_head
+        + offs_dv[None, :],
+        (acc / e_sum_safe[:, None]).to(
+            tl.float16 if IS_FP16 else tl.bfloat16
+        ),
+        mask=mask_h[:, None] & mask_dv[None, :],
+    )
 
 
 @functools.lru_cache(maxsize=256)
@@ -577,6 +708,7 @@ def triton_mla_sparse_attention_fp8(
             kv_group_num=kv_group_num,
             BLOCK_H=_BLOCK_H,
             IS_FP16=(q.dtype == torch.float16),
+            IDX_SPAN=triton.next_power_of_2(index_topk),
         )
         return out
 
@@ -607,13 +739,13 @@ def triton_mla_sparse_attention_fp8(
         kv_group_num=kv_group_num,
         BLOCK_H=_BLOCK_H,
         LOGE2=LOGE2,
+        IDX_SPAN=triton.next_power_of_2(triton.cdiv(index_topk, num_kv_splits)),
         IS_FP16=(q.dtype == torch.float16),
     )
 
-    # Stage 2 is dtype-agnostic (fp32 partials), so reuse the bf16 kernel's.
-    from vllm.v1.attention.ops.triton_mla_sparse_kernel import _sparse_mla_merge_kernel
-
-    _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
+    _sparse_mla_fp8_merge_kernel[
+        (num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)
+    ](
         mid_out_ptr=mid_out,
         out_ptr=out,
         h_q=num_heads_q,
@@ -627,6 +759,7 @@ def triton_mla_sparse_attention_fp8(
         BLOCK_H=_MERGE_BLOCK_H,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DV_TILE=_MERGE_BLOCK_DV_TILE,
+        IS_FP16=(q.dtype == torch.float16),
         num_warps=2,
     )
     return out

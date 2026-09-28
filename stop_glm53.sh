@@ -1,1 +1,0 @@
-stop_glm52.sh
