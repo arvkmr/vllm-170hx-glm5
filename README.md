@@ -16,10 +16,14 @@ lacks for this target on Ampere.
 | KV cache | packed `fp8_ds_mla` (656 B/token/layer) + fp8 indexer keys, block 128 |
 | Context | 1,048,576 tokens; ~1.87M tokens of KV reported (2.09M pool) |
 | Speculation | DFlash2, k=7, ~3.5-3.9 accepted tokens/step |
-| Decode | ~90-94 ms/step, ~39-41 tok/s single stream (FULL decode graphs); 152 tok/s aggregate at 8 streams |
+| Decode (default clocks)| ~85-89 ms/step, ~41-44 tok/s single stream (FULL decode graphs) |
+| Decode (+250 MHz VF)| ~90-94 ms/step, ~39-41 tok/s single stream (FULL decode graphs); 152 tok/s aggregate at 8 streams |
 | Prefill | ~1.8-2.0K tok/s for one 8K prompt, ~2.4K tok/s at 32K or 8 concurrent |
 
+Underclocking leads to 3-5% lost performance with 10-20% power savings
+
 ## Performance
+
 
 Measured 2026-09-28 on the `agent` profile (10 cards; the core profile
 applies +250 MHz VF offset and a 1350 MHz SM ceiling, with 1300 MHz on the one

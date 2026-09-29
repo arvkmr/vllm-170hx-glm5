@@ -32,6 +32,9 @@ case "$PROFILE" in
 esac
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9}
+# PP_SIZE x TP_SIZE must equal the visible GPU count; consecutive devices form
+# a TP group (0,1), (2,3), ... which are the same-host-bridge pairs here.
+export PP_SIZE=${PP_SIZE:-10}
 export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-10,8,8,8,8,8,8,8,8,4}
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$ROOT/cache/vllm}
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$ROOT/cache/torchinductor}
@@ -133,7 +136,7 @@ exec "$VENV/bin/vllm" serve "$MODEL" \
   "${SPEC[@]}" \
   --served-model-name "${SERVED_MODEL_NAME:-glm-5.3}" \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8001}" \
-  --pipeline-parallel-size 10 --tensor-parallel-size 1 \
+  --pipeline-parallel-size "$PP_SIZE" --tensor-parallel-size "${TP_SIZE:-1}" \
   --attention-backend TRITON_MLA_SPARSE "${SCHED_ARGS[@]}" \
   --dtype bfloat16 --kv-cache-dtype fp8_ds_mla --block-size "${BLOCK_SIZE:-128}" \
   "${GRAPH[@]}" "${KERNEL_ARGS[@]}" \

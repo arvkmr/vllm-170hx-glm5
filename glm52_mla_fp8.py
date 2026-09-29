@@ -149,6 +149,28 @@ KV_SPLITS_CANDIDATES = (1, 2, 4, 8, 16)
 _MIN_TOPK_PER_SPLIT = 128
 _SPLIT_MAX_OCCUPANCY = 4
 
+# Wide-head decode launch (GLM52_MLA_WIDE=0 disables). With BLOCK_H=16 the 64
+# heads span four programs, and each one gathers and e4m3-decodes the same
+# topk rows: 4x the scattered HBM traffic in a latency-bound kernel. One
+# program per (row, split) covering all 64 heads, with wider tiles, measured on
+# CMP 170HX under CUDA-graph replay (2026-09-29, 600 and 100K context):
+#   rows   4:  71-88 -> 53 us    rows 8: 127-153 -> 78-85 us
+#   rows  16: 236-275 -> 133-148 us    rows 24-32: 433-534 -> 237-265 us
+# Error vs an fp32 reference equals the BLOCK_H=16 launch at every shape. 1-2
+# rows are already fastest on the existing launch and keep it, as do prefill
+# and single-pass shapes. Pinned (not autotuned) for boot-to-boot determinism.
+_WIDE_BLOCK_H = 64
+_WIDE_MIN_ROWS, _WIDE_MAX_ROWS = 3, 32
+_WIDE_ON = _os.environ.get("GLM52_MLA_WIDE", "1") == "1"
+
+
+def _wide_decode_splits(num_tokens: int, index_topk: int) -> int:
+    """Best measured split count for the wide launch at this row count."""
+    splits = 16 if num_tokens <= 4 else 8 if num_tokens <= 12 else 4 if num_tokens <= 20 else 2
+    while splits > 1 and index_topk % splits != 0:
+        splits //= 2
+    return splits
+
 
 @triton.jit
 def _e4m3_bytes_to_bf16(b, IS_FP16: tl.constexpr):
@@ -674,9 +696,19 @@ def triton_mla_sparse_attention_fp8(
     seq_kv = kv.shape[0]
 
     kv_group_num = num_heads_q
-    num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
+    wide = (
+        _WIDE_ON
+        and not num_kv_splits
+        and num_heads_q == _WIDE_BLOCK_H
+        and _WIDE_MIN_ROWS <= num_tokens <= _WIDE_MAX_ROWS
+        and _wide_decode_splits(num_tokens, index_topk) > 1
+    )
+    block_h = _WIDE_BLOCK_H if wide else _BLOCK_H
+    num_head_groups = triton.cdiv(num_heads_q, min(block_h, kv_group_num))
 
-    if num_kv_splits is None or num_kv_splits == 0:
+    if wide:
+        num_kv_splits = _wide_decode_splits(num_tokens, index_topk)
+    elif num_kv_splits is None or num_kv_splits == 0:
         if sm_count is None:
             sm_count = num_compute_units(q.device.index)
         num_kv_splits = _choose_num_kv_splits(
@@ -717,7 +749,15 @@ def triton_mla_sparse_attention_fp8(
         dtype=torch.float32,
         device=q.device,
     )
-    _sparse_mla_fp8_kernel_split[(num_tokens, num_head_groups, num_kv_splits)](
+    # The wide launch bypasses the autotuner (it has no hooks) with its own
+    # pinned tile; everything else keeps the autotuner's pinned config.
+    if wide:
+        split_kernel = _sparse_mla_fp8_kernel_split.fn
+        wide_meta = dict(BLOCK_N=64, num_warps=8, num_stages=2)
+    else:
+        split_kernel = _sparse_mla_fp8_kernel_split
+        wide_meta = {}
+    split_kernel[(num_tokens, num_head_groups, num_kv_splits)](
         q_buffer=q,
         kv_u8=kv_u8,
         kv_f32=kv_f32,
@@ -737,10 +777,11 @@ def triton_mla_sparse_attention_fp8(
         index_topk=index_topk,
         NUM_KV_SPLITS=num_kv_splits,
         kv_group_num=kv_group_num,
-        BLOCK_H=_BLOCK_H,
+        BLOCK_H=block_h,
         LOGE2=LOGE2,
         IDX_SPAN=triton.next_power_of_2(triton.cdiv(index_topk, num_kv_splits)),
         IS_FP16=(q.dtype == torch.float16),
+        **wide_meta,
     )
 
     _sparse_mla_fp8_merge_kernel[

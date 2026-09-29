@@ -66,7 +66,8 @@ def validate_partition(config: dict, text: str) -> list[int]:
         partition = [int(value) for value in text.split(",")]
     except ValueError as exc:
         raise SystemExit("preflight: PP partition must be comma-separated integers") from exc
-    require(len(partition) == 10, "PP partition must contain exactly ten stages")
+    stages = int(os.environ.get("PP_SIZE", "10"))
+    require(len(partition) == stages, f"PP partition must contain exactly {stages} stages")
     require(all(value > 0 for value in partition), "PP partition entries must be positive")
     require(sum(partition) == TARGET_SHAPE["num_hidden_layers"], "PP partition must sum to 78")
 
