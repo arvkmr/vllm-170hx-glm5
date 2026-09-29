@@ -727,6 +727,158 @@ def patch_runner_lmhead_quant(runner: str) -> str:
     )
 
 
+MLA_HEAD_BMM_MARKER = "local-cmp170hx-mla-head-bmm"
+
+
+def patch_mla_head_bmm(mla: str) -> str:
+    """Route MLA decode's two absorbed up-projection bmms (W_UK_T, W_UV)
+    through the sm_80 per-head kernel in glm52_mla_bmm.py; it falls back to
+    torch.bmm itself outside its envelope (> 32 rows, other dtypes/shapes)."""
+    mla = replace_once(
+        mla,
+        "                    mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))\n"
+        "                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))\n",
+        "                    mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))\n"
+        f"                    # {MLA_HEAD_BMM_MARKER}\n"
+        "                    from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm\n"
+        "\n"
+        "                    _glm52_head_bmm(mqa_q_nope, W_UK_T, mqa_ql_nope.transpose(0, 1))\n",
+        "MLA decode W_UK_T bmm",
+    )
+    mla = replace_once(
+        mla,
+        "            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)\n"
+        "            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))\n",
+        "            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)\n"
+        f"            # {MLA_HEAD_BMM_MARKER}\n"
+        "            from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm\n"
+        "\n"
+        "            _glm52_head_bmm(x, self.W_UV, out.transpose(0, 1))\n",
+        "MLA decode W_UV bmm",
+    )
+    # First load registers the permuted *view* as the parameter, so W_UK_T is
+    # strided 12288 elements along its 512-wide output and W_UV has a
+    # 16384-element K stride; the kernel above wants each head's [K, N] block
+    # contiguous. Materialize them once at load (copies of a dequantized
+    # temporary that is freed right after, so no memory is added).
+    mla = replace_once(
+        mla,
+        '            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)\n'
+        "            # Convert from (L, N, P) to (N, P, L)\n"
+        '            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)\n',
+        f"            # {MLA_HEAD_BMM_MARKER}: contiguous per-head blocks.\n"
+        "            replace_parameter(\n"
+        '                self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True\n'
+        "            )\n"
+        "            # Convert from (L, N, P) to (N, P, L)\n"
+        "            replace_parameter(\n"
+        '                self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True\n'
+        "            )\n",
+        "MLA contiguous W_UK_T / W_UV",
+    )
+    return mla
+
+
+def patch_dsv32_head_bmm(attn: str) -> str:
+    """The DSA model's own attention module runs its absorbed up-projections
+    itself (it subclasses MLAAttention, so the contiguous weights above apply).
+    W_UK_T sits in the torch.compile-traced forward, so it goes through the
+    registered custom op; W_UV runs in the eager-break attention region and
+    calls the kernel directly. Output layouts are those of the replaced bmms."""
+    attn = replace_once(
+        attn,
+        "from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q\n",
+        "from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q\n"
+        f"# {MLA_HEAD_BMM_MARKER}: also registers torch.ops.vllm.glm52_head_bmm_new.\n"
+        "from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm\n",
+        "DSA attention head bmm import",
+    )
+    attn = replace_once(
+        attn,
+        "        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)\n",
+        f"        # {MLA_HEAD_BMM_MARKER}\n"
+        "        ql_nope = torch.ops.vllm.glm52_head_bmm_new(\n"
+        "            q_nope.transpose(0, 1), self.W_UK_T\n"
+        "        ).transpose(0, 1)\n",
+        "DSA attention W_UK_T bmm",
+    )
+    attn = replace_once(
+        attn,
+        "        torch.bmm(x, self.W_UV, out=out)\n",
+        f"        # {MLA_HEAD_BMM_MARKER}\n"
+        "        _glm52_head_bmm(x, self.W_UV, out)\n",
+        "DSA attention W_UV bmm",
+    )
+    return attn
+
+
+THIN_GEMM_DSA_MARKER = "local-cmp170hx-thin-gemm-dsa"
+
+
+def patch_thin_gemm_dsa(thin: str) -> str:
+    """Keep two GLM-5.3 shapes on cuBLAS where the fork's thin-M BF16 GEMM
+    loses (measured, graph replay, CMP 170HX): the dense MLP / drafter
+    gate_up (24576 x 6144, 0.84-0.96x at M=8-16) and the drafter fc
+    (6144 x 36864, 0.73x at M=32). Every other shape of this model wins."""
+    return replace_once(
+        thin,
+        "_CUBLAS_FROM_M: dict[tuple[int, int], int] = {(4096, 8192): 17}\n",
+        f"# {THIN_GEMM_DSA_MARKER}: GLM-5.3 shapes where cuBLAS wins.\n"
+        "_CUBLAS_FROM_M: dict[tuple[int, int], int] = {\n"
+        "    (4096, 8192): 17, (24576, 6144): 1, (6144, 36864): 17,\n"
+        "}\n",
+        "thin GEMM cuBLAS table",
+    )
+
+
+ROUTE_V2_DSA_MARKER = "local-cmp170hx-route-v2-dsa"
+
+
+def patch_route_v2_dsa(init: str, warmup: str) -> tuple[str, str]:
+    """Let the fork's fused sm_80 MoE router (VLLM_GLM5_DECODE_MOE_ROUTE_V2)
+    serve GLM-5.3's 256-expert, hidden-6144 router, not only GLM-5.3-Flash's
+    288 x 4096. The kernel and its tiling are shape-generic (E=256 splits as
+    128+128, K=6144 fits the split-K tiling); only the host gates pin 288/4096.
+    Checked against the production chain (cuBLAS fp32 logits ->
+    fused_grouped_topk -> deterministic_moe_align_block_size) on real router
+    weights: expert ids and the whole Marlin alignment identical, logits and
+    weights differ only by fp32 rounding (<= 3.3e-6 / 9e-8)."""
+    init = replace_once(
+        init,
+        '    bias = getattr(router, "e_score_correction_bias", None)\n'
+        "    if bias is None or bias.dtype != torch.float32 or tuple(bias.shape) != (288,):\n"
+        "        return False\n"
+        '    w = getattr(gate, "weight", None)\n'
+        "    if w is None or w.dtype != torch.bfloat16 or tuple(w.shape) != (288, 4096):\n"
+        "        return False\n",
+        f"    # {ROUTE_V2_DSA_MARKER}: also GLM-5.3's 256 x 6144 router.\n"
+        '    w = getattr(gate, "weight", None)\n'
+        "    if w is None or w.dtype != torch.bfloat16 or tuple(w.shape) not in (\n"
+        "        (288, 4096), (256, 6144)\n"
+        "    ):\n"
+        "        return False\n"
+        "    _route_e, _route_k = (int(d) for d in w.shape)\n"
+        '    bias = getattr(router, "e_score_correction_bias", None)\n'
+        "    if bias is None or bias.dtype != torch.float32 or tuple(bias.shape) != (_route_e,):\n"
+        "        return False\n",
+        "route v2 gate: expert/hidden shape",
+    )
+    init = replace_once(
+        init,
+        "    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != 4096:\n",
+        "    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != _route_k:\n",
+        "route v2 gate: activation width",
+    )
+    warmup = replace_once(
+        warmup,
+        "    if (num_experts, topk, hidden) != (288, 8, 4096):\n",
+        f"    # {ROUTE_V2_DSA_MARKER}: also GLM-5.3's 256 x 6144 router.\n"
+        "    if (num_experts, topk, hidden) not in ((288, 8, 4096), (256, 8, 6144)):\n",
+        "route v2 warmup shape",
+    )
+    return init, warmup
+
+
 def patch_dsv32_aux_over_pp(model: str) -> str:
     """Relay DFlash/EAGLE aux hidden states across PP stages for the DSA model."""
     model = replace_once(
@@ -863,7 +1015,12 @@ def patch_source(source: Path, helper: Path, *, check: bool) -> None:
     runner_path = source / "vllm/v1/worker/gpu/model_runner.py"
     kvu_path = source / "vllm/v1/core/kv_cache_utils.py"
     lmhead_helper = Path(__file__).resolve().parent / "glm52_lmhead_quant.py"
-    for path in (backend_path, mla_path, dsv32_path, kernels_path, indexer_path, topk_path, runner_path, kvu_path, helper, canon_helper, lmhead_helper):
+    mla_bmm_helper = Path(__file__).resolve().parent / "glm52_mla_bmm.py"
+    thin_path = source / "vllm/ampere_thin_gemm/__init__.py"
+    dsv32_attn_path = source / "vllm/models/deepseek_v32/attention.py"
+    route_init_path = source / "vllm/ampere_decode/__init__.py"
+    route_warmup_path = source / "vllm/ampere_decode/warmup.py"
+    for path in (backend_path, mla_path, dsv32_path, kernels_path, indexer_path, topk_path, runner_path, kvu_path, helper, canon_helper, lmhead_helper, mla_bmm_helper, thin_path, dsv32_attn_path, route_init_path, route_warmup_path):
         if not path.is_file():
             raise RuntimeError(f"missing required file: {path}")
 
@@ -943,12 +1100,18 @@ def patch_source(source: Path, helper: Path, *, check: bool) -> None:
         "canonicalize packed-fp8 cache dtype",
     )
 
+    mla = patch_mla_head_bmm(mla)
     dsv32 = patch_dsv32_aux_over_pp(dsv32_path.read_text())
     kernels = patch_dsv32_sm80_fp8(kernels_path.read_text())
     indexer = patch_indexer_sm80(indexer_path.read_text())
     topk = patch_topk_canon_decode(topk_path.read_text())
     runner = patch_runner_lmhead_quant(runner_path.read_text())
     kvu = patch_kv_cache_dsa_dflash(kvu_path.read_text())
+    thin = patch_thin_gemm_dsa(thin_path.read_text())
+    dsv32_attn = patch_dsv32_head_bmm(dsv32_attn_path.read_text())
+    route_init, route_warmup = patch_route_v2_dsa(
+        route_init_path.read_text(), route_warmup_path.read_text()
+    )
 
     ast.parse(backend, filename=str(backend_path))
     ast.parse(mla, filename=str(mla_path))
@@ -958,7 +1121,12 @@ def patch_source(source: Path, helper: Path, *, check: bool) -> None:
     ast.parse(topk, filename=str(topk_path))
     ast.parse(runner, filename=str(runner_path))
     ast.parse(kvu, filename=str(kvu_path))
+    ast.parse(thin, filename=str(thin_path))
+    ast.parse(dsv32_attn, filename=str(dsv32_attn_path))
+    ast.parse(route_init, filename=str(route_init_path))
+    ast.parse(route_warmup, filename=str(route_warmup_path))
     ast.parse(lmhead_helper.read_text(), filename=str(lmhead_helper))
+    ast.parse(mla_bmm_helper.read_text(), filename=str(mla_bmm_helper))
     ast.parse(canon_helper.read_text(), filename=str(canon_helper))
     ast.parse(helper.read_text(), filename=str(helper))
 
@@ -975,7 +1143,12 @@ def patch_source(source: Path, helper: Path, *, check: bool) -> None:
     shutil.copyfile(canon_helper, source / "vllm/_glm52_topk_canon.py")
     runner_path.write_text(runner)
     kvu_path.write_text(kvu)
+    thin_path.write_text(thin)
+    dsv32_attn_path.write_text(dsv32_attn)
+    route_init_path.write_text(route_init)
+    route_warmup_path.write_text(route_warmup)
     shutil.copyfile(lmhead_helper, source / "vllm/_glm52_lmhead_quant.py")
+    shutil.copyfile(mla_bmm_helper, source / "vllm/_glm52_mla_bmm.py")
     destination = source / "vllm/_glm52_mla_fp8.py"
     shutil.copyfile(helper, destination)
     digest = hashlib.sha256(helper.read_bytes()).hexdigest()

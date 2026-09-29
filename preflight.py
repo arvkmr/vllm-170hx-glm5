@@ -123,6 +123,19 @@ def validate_engine(source: Path) -> None:
         in (source / "vllm/v1/core/kv_cache_utils.py").read_text(),
         "DSA DFlash window-bounded drafter KV patch missing; rerun install.sh",
     )
+    require(
+        "local-cmp170hx-route-v2-dsa"
+        in (source / "vllm/ampere_decode/__init__.py").read_text(),
+        "fused MoE router gate for the 256 x 6144 router missing; rerun install.sh",
+    )
+    require(
+        "local-cmp170hx-mla-head-bmm"
+        in (source / "vllm/model_executor/layers/attention/mla_attention.py").read_text()
+        and "local-cmp170hx-mla-head-bmm"
+        in (source / "vllm/models/deepseek_v32/attention.py").read_text()
+        and (source / "vllm/_glm52_mla_bmm.py").is_file(),
+        "MLA per-head decode bmm patch missing; rerun install.sh",
+    )
     installed_helper = source / "vllm/_glm52_mla_fp8.py"
     project_helper = Path(__file__).resolve().parent / "glm52_mla_fp8.py"
     require(installed_helper.is_file(), "packed-fp8 reader is missing from the engine")

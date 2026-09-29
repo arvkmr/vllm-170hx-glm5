@@ -69,7 +69,26 @@ export VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-12
 # The fork's fused cache-write glue assumes its BF16 reference path. Keep that
 # family off until the packed-fp8 path has a dedicated equivalence benchmark.
 export VLLM_GLM5_DECODE_IDX_GLUE=0
-export VLLM_GLM5_DECODE_KERNELS=${VLLM_GLM5_DECODE_KERNELS:-0}
+# Of the fork's sm_80 decode kernels only the fused MoE router is used: gate
+# GEMV + sigmoid top-k + Marlin alignment in one launch (~11 us vs ~39 us per
+# MoE layer). apply_engine_patch.py widens its gate to this 256 x 6144 router;
+# expert ids and alignment are identical to the unfused chain. The other
+# families are off (mHC/KDA belong to GLM-5.3-Flash; moe_routing is 288-expert
+# only), and DECODE_MOE_MAX_TOKENS=0 keeps the MoE padding mask at every batch
+# size -- with the decode kernels on, the runner otherwise skips it at <= 8 rows.
+export VLLM_GLM5_DECODE_KERNELS=${VLLM_GLM5_DECODE_KERNELS:-1}
+export VLLM_GLM5_DECODE_MOE_ROUTE_V2=${VLLM_GLM5_DECODE_MOE_ROUTE_V2:-1}
+export VLLM_GLM5_DECODE_MOE_ROUTING=0 VLLM_GLM5_DECODE_MOE_MAX_TOKENS=0
+export VLLM_GLM5_DECODE_MHC=0 VLLM_GLM5_DECODE_MHC_V2=0
+export VLLM_GLM5_DECODE_KDA=0 VLLM_GLM5_DECODE_KDA_V2=0
+# Enqueue the shared experts on the aux stream after the routed experts so the
+# two actually overlap (enqueue order only; numerics unchanged). ~1 ms/step.
+export VLLM_GLM5_SHARED_EXPERT_REORDER=${VLLM_GLM5_SHARED_EXPERT_REORDER:-1}
+# The fork's sm_80 thin-M BF16 GEMM (indexer, dense layers 0-2, drafter,
+# lm_head) is OFF: on this model it saves only ~0.75 ms/step and DFlash2
+# acceptance measured 4% lower with it (3.22 vs 3.36 tok/step, 8 prompts).
+# apply_engine_patch.py still keeps its two losing shapes on cuBLAS.
+export VLLM_GLM5_THIN_GEMM=${VLLM_GLM5_THIN_GEMM:-0}
 
 # Pipeline optimizations have kill switches and are enabled only after the
 # eager smoke/correctness gate, not merely because the fork provides them.

@@ -15,9 +15,8 @@ lacks for this target on Ampere.
 | Parallelism | PP=10, TP=1, partition `10,8,8,8,8,8,8,8,8,4` |
 | KV cache | packed `fp8_ds_mla` (656 B/token/layer) + fp8 indexer keys, block 128 |
 | Context | 1,048,576 tokens; ~1.87M tokens of KV reported (2.09M pool) |
-| Speculation | DFlash2, k=7, ~3.5-3.9 accepted tokens/step |
-| Decode (default clocks)| ~85-89 ms/step, ~41-44 tok/s single stream (FULL decode graphs) |
-| Decode (+250 MHz VF)| ~90-94 ms/step, ~39-41 tok/s single stream (FULL decode graphs); 152 tok/s aggregate at 8 streams |
+| Speculation | DFlash2, k=7, ~3.3-3.9 accepted tokens/step |
+| Decode (+250 MHz VF, 1350 MHz ceiling)| ~81-83 ms/step, ~41-49 tok/s single stream (FULL decode graphs); 174 tok/s aggregate at 8 streams |
 | Prefill | ~1.8-2.0K tok/s for one 8K prompt, ~2.4K tok/s at 32K or 8 concurrent |
 
 Underclocking leads to 3-5% lost performance with 10-20% power savings
@@ -25,11 +24,11 @@ Underclocking leads to 3-5% lost performance with 10-20% power savings
 ## Performance
 
 
-Measured 2026-09-28 on the `agent` profile (10 cards; the core profile
+Measured 2026-09-29 on the `agent` profile (10 cards; the core profile
 applies +250 MHz VF offset and a 1350 MHz SM ceiling, with 1300 MHz on the one
-marginal card; 180 W power cap). C8 needs 8 seats, so every row was measured
-with `MAX_SEQS=8`. That leaves 1,832,659 KV tokens against 1,874,240 at the
-default 4 seats. C1 and C4 matched the default profile within 4%.
+marginal card; 170 W power cap; SM clocks sampled under load at 1350 / 1290
+MHz). C8 needs 8 seats, so every row was measured with `MAX_SEQS=8`, which
+leaves 1,824,985 KV tokens.
 
 Decode: C concurrent greedy streams, 512 tokens each (`ignore_eos`), a
 different prompt per stream (prose, code, technical). Prefill: C concurrent
@@ -37,11 +36,25 @@ requests of ~7.8K unique prompt tokens (no prefix-cache hits), `max_tokens=1`.
 
 | Concurrency | Per-stream decode | Aggregate decode | Spec tokens/step | Prefill TTFT mean / max | Aggregate prefill |
 |---|---|---|---|---|---|
-| C1 | 39.7 tok/s | 39.2 tok/s | 3.55 | 4.3 s / 4.3 s | 1,836 tok/s |
-| C4 | 29.0 tok/s (min 26.4) | 102.1 tok/s | 3.47 | 9.9 s / 14.6 s | 2,140 tok/s |
-| C8 | 22.5 tok/s (min 20.0) | 152.2 tok/s | 3.21 | 15.1 s / 25.5 s | 2,460 tok/s |
+| C1 | 48.7 tok/s | 48.0 tok/s | 3.92 | 4.3 s / 4.3 s | 1,833 tok/s |
+| C4 | 32.6 tok/s (min 27.8) | 108.4 tok/s | 3.46 | 9.9 s / 14.1 s | 2,225 tok/s |
+| C8 | 27.1 tok/s (min 22.4) | 174.1 tok/s | 3.31 | 16.2 s / 26.6 s | 2,351 tok/s |
 
-A single 31K-token prompt prefills in 13.1 s (2,386 tok/s). Prefill is
+Previous table (2026-09-28, before the decode kernel work below): C1 39.7,
+C4 29.0 per stream / 102.1 aggregate, C8 22.5 / 152.2 tok/s; prefill
+unchanged within noise.
+
+Per-stream tok/s from a single prompt swings with DFlash2 acceptance (3.55
+vs 3.92 tokens/step above for the same prompt, because any numerical change
+alters the greedy text). For A/B work use `accept_bench.py`, which runs all
+eight prompts for 384 tokens each and reports ms/step, the kernel-side cost:
+
+| Build (`MAX_SEQS=8`) | ms/step | tokens/step | tok/s |
+|---|---|---|---|
+| Decode kernel work off (`GLM52_MLA_WIDE=0 GLM52_MLA_HEAD_BMM=0 VLLM_GLM5_DECODE_KERNELS=0 VLLM_GLM5_SHARED_EXPERT_REORDER=0`) | 92.0 | 3.26 | 35.4 |
+| Default | **82.7** | 3.41 | **41.3** |
+
+A single 31K-token prompt prefills in 13.1 s (2,372 tok/s). Prefill is
 chunked at `max_num_batched_tokens=512` through a 10-stage pipeline, so it
 gains only ~25-35% from concurrency. Decode throughput scales with
 concurrency. Speculative acceptance dips slightly as streams are added.
@@ -49,14 +62,14 @@ concurrency. Speculative acceptance dips slightly as streams are added.
 Reproduce with `bench_conc.py` against a running server:
 
 ```bash
-MAX_SEQS=8 PROFILE=agent ./start.sh
+MAX_SEQS=8 ./start.sh
 python3 bench_conc.py 8000 decode 8 512     # C8 decode
 python3 bench_conc.py 8000 prefill 8 8192   # C8 prefill
 ```
 
-The default `agent` profile (4 seats) measured C1 39.6 tok/s decode and
-1,973 tok/s prefill, and C4 98.1 tok/s aggregate decode and 2,227 tok/s
-prefill. Those are within run-to-run noise of the rows above.
+```bash
+python3 accept_bench.py 8000 384            # 8-prompt ms/step + acceptance
+```
 
 ## What the patches do
 
@@ -91,6 +104,32 @@ checks the markers before launch.
 - **Optional W8 lm_head** (`glm52_lmhead_quant.py`, `GLM52_LMHEAD_BITS=8`):
   off by default (~0.5 ms/step gain, small top-1 changes).
 
+### Decode kernel work (2026-09-29)
+
+From a per-rank critical-path profile of a C1 step. Each has a kill switch;
+none reduces precision (all fp32 accumulation, pinned configs, bitwise
+reproducible boot to boot).
+
+| Change | Switch | Saved |
+|---|---|---|
+| Wide-head sparse-MLA decode launch: 64 heads per program instead of 16, so each topk row is gathered and e4m3-decoded once, not 4x; splits by row count (3-32 rows). Kernel 127-181 -> 85-92 us at 8 rows; error vs fp32 identical | `GLM52_MLA_WIDE` | ~5-6 ms |
+| Fork's fused sm_80 MoE router (gate GEMV + sigmoid top-k + Marlin alignment, one launch, ~11 us vs ~46 us per layer), gate widened from GLM-5.3-Flash's 288x4096 to this 256x6144 router. Expert ids and the Marlin alignment identical to the unfused chain on real router weights; logits differ by fp32 rounding only | `VLLM_GLM5_DECODE_KERNELS`, `VLLM_GLM5_DECODE_MOE_ROUTE_V2` | ~2-3 ms |
+| Shared experts enqueued on the aux stream after the routed experts, so they overlap (fork flag; enqueue order only) | `VLLM_GLM5_SHARED_EXPERT_REORDER` | ~1 ms |
+| Per-head Triton kernel for MLA's absorbed W_UK / W_UV bmms (`glm52_mla_bmm.py`), weights made contiguous at load; 1.3-1.45 TB/s vs cuBLAS 0.8-0.9 | `GLM52_MLA_HEAD_BMM` | ~0.6 ms |
+
+`serve.sh` keeps the MoE padding mask at every batch size with the decode
+kernels on (`VLLM_GLM5_DECODE_MOE_MAX_TOKENS=0`), and leaves the fork's
+thin-M BF16 GEMM off (`VLLM_GLM5_THIN_GEMM`): ~0.75 ms/step, but DFlash2
+acceptance measured 4% lower with it.
+
+Measured and not worth it on this host: TP=2 x PP=5 (NCCL all-reduce of one
+decode hidden state is ~100 us on Gen2 x4, ~4.5% net, and it crashed); plain
+PP=8 (stages must start on index-producing layers, which forces 12-layer
+stages that do not fit); an HBM overclock (NDIV70 corrupts output, no ECC);
+a Triton W8A16 GEMM for the dense INT8 layers (slower than Marlin, which is
+within ~35% of the read floor at these sizes). The MoE experts (~56% of the
+step) already stream at the HBM bandwidth limit.
+
 ## Install
 
 ```bash
@@ -105,7 +144,8 @@ wheel and applies the patches. Nothing outside `~/vllm_glm53_dflash2` changes.
 ## Run
 
 ```bash
-PROFILE=agent ./start.sh      # background; logs/serve.log, logs/vllm.pid
+./start.sh                    # production: agent profile on 0.0.0.0:8000, background
+                              # logs/serve.log, logs/vllm.pid
 ./smoke.sh                    # health + one chat request
 ./stop.sh                     # stops only the recorded process group
 PROFILE=agent ./serve.sh      # foreground equivalent
@@ -113,8 +153,8 @@ PROFILE=agent ./serve.sh      # foreground equivalent
 
 | Profile | Context | Seqs | Batched tokens | Graphs | Bind |
 |---|---|---|---|---|---|
-| `smoke` (default) | 32K | 1 | 1024 | eager | 127.0.0.1:8001 |
-| `agent` | 1,048,576 | 4 | 512 | FULL + PIECEWISE | 0.0.0.0:8000 |
+| `smoke` (`serve.sh` default) | 32K | 1 | 1024 | eager | 127.0.0.1:8001 |
+| `agent` (`start.sh` default) | 1,048,576 | 4 | 512 | FULL + PIECEWISE | 0.0.0.0:8000 |
 | `production` | 1,048,576 | 8 | 2048 | FULL + PIECEWISE | 127.0.0.1:8001 |
 
 Useful switches (environment): `MODEL`, `DFLASH_MODEL`, `MAX_LEN`, `MAX_SEQS`,
