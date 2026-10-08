@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from preflight import (
@@ -59,6 +61,36 @@ class VllmNextContracts(unittest.TestCase):
         with self.assertRaises(SystemExit):
             validate_partition(target_config(), "8,8,8,8,8,8,8,8,8,6")
 
+    def test_pp8_and_pp9_partitions_need_the_topk_relay(self) -> None:
+        serve = (NEXT / "serve.sh").read_text()
+        for size, partition in (("8", "11,10,10,10,10,10,9,8"), ("9", "10,9,9,9,9,9,9,8,6")):
+            self.assertIn(f"DEFAULT_PARTITION={partition}", serve)
+            with unittest.mock.patch.dict(os.environ, {"PP_SIZE": size, "TP_SIZE": "1"}):
+                with self.assertRaises(SystemExit):
+                    validate_partition(target_config(), partition)
+                part = validate_partition(target_config(), partition, topk_relay=True)
+            self.assertEqual(sum(part), 78)
+        patch = (NEXT / "apply_engine_patch.py").read_text()
+        self.assertIn("patch_dsv32_topk_pp_relay(patch_dsv32_aux_over_pp(", patch)
+
+    def test_pp_size_defaults(self) -> None:
+        # Evaluate only serve.sh's PP block, so no engine or GPU is needed.
+        serve = (NEXT / "serve.sh").read_text()
+        block = serve[serve.index("# Pipeline depth"):]
+        block = block[: block.index("\n", block.index("export VLLM_PP_LAYER_PARTITION")) + 1]
+        script = block + 'echo "$CUDA_VISIBLE_DEVICES|$VLLM_PP_LAYER_PARTITION|${GPU_UTIL:-0.93}"'
+        def run(**env: str) -> subprocess.CompletedProcess:
+            clean = {k: v for k, v in os.environ.items()
+                     if k not in ("PP_SIZE", "TP_SIZE", "CUDA_VISIBLE_DEVICES",
+                                  "VLLM_PP_LAYER_PARTITION", "GPU_UTIL")}
+            return subprocess.run(["bash", "-c", script], env={**clean, **env},
+                                  capture_output=True, text=True)
+        self.assertEqual(run().stdout.split("|")[1:], ["11,10,10,10,10,10,9,8", "0.96\n"])
+        self.assertEqual(run(PP_SIZE="8").stdout.split("|")[0], "0,1,2,3,4,5,7,8")
+        self.assertEqual(run(PP_SIZE="9").stdout.split("|")[1], "10,9,9,9,9,9,9,8,6")
+        self.assertEqual(run(PP_SIZE="10").stdout.split("|")[1:], ["10,8,8,8,8,8,8,8,8,4", "0.93\n"])
+        self.assertNotEqual(run(PP_SIZE="7").returncode, 0)
+
     def test_versions_are_immutable_pins(self) -> None:
         versions = (NEXT / "versions.env").read_text()
         self.assertIn(
@@ -73,7 +105,7 @@ class VllmNextContracts(unittest.TestCase):
         serve = (NEXT / "serve.sh").read_text()
         self.assertIn('"method\\":\\"dflash', serve)
         self.assertIn("--kv-cache-dtype fp8_ds_mla", serve)
-        self.assertIn("--pipeline-parallel-size 10", serve)
+        self.assertIn('--pipeline-parallel-size "$PP_SIZE"', serve)
         self.assertIn("VLLM_GLM5_DECODE_IDX_GLUE=0", serve)
         self.assertIn("PROFILE=${PROFILE:-smoke}", serve)
 

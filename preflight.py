@@ -61,7 +61,15 @@ def validate_draft(config: dict) -> None:
     require(dflash.get("selector_top_k") == 16, "drafter selector_top_k must be 16")
 
 
-def validate_partition(config: dict, text: str) -> list[int]:
+TOPK_RELAY_MARKER = "local-cmp170hx-dsv32-topk-pp-relay"
+
+
+def engine_has_topk_relay(source: Path) -> bool:
+    model = source / "vllm/models/deepseek_v32/nvidia/model.py"
+    return model.is_file() and TOPK_RELAY_MARKER in model.read_text()
+
+
+def validate_partition(config: dict, text: str, topk_relay: bool = False) -> list[int]:
     try:
         partition = [int(value) for value in text.split(",")]
     except ValueError as exc:
@@ -83,7 +91,15 @@ def validate_partition(config: dict, text: str) -> list[int]:
         starts.append(cursor)
         cursor += width
     bad = [layer for layer in starts if max(layer - offset + 1, 0) % freq != 0]
-    require(not bad, f"PP stages {bad} begin on shared/skip-topk layers")
+    # With the top-k PP relay (local-cmp170hx-dsv32-topk-pp-relay) the
+    # upstream stage ships its selections across the boundary, so a stage may
+    # begin on a skip-topk layer (needed for PP=9: 78 layers cannot be split
+    # into 9 producer-aligned stages without a ~60 GiB stage).
+    require(
+        not bad or topk_relay,
+        f"PP stages {bad} begin on shared/skip-topk layers and the engine "
+        "lacks the top-k PP relay",
+    )
     return partition
 
 
@@ -162,31 +178,53 @@ def validate_gpu_host(require_idle: bool) -> None:
         query = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-gpu=index,name,memory.total",
+                "--query-gpu=index,pci.bus_id,name,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
         )
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"preflight: nvidia-smi failed: {exc}") from exc
-    rows = [line for line in query.splitlines() if line.strip()]
-    require(len(rows) == 10, f"expected 10 visible GPUs, found {len(rows)}")
-    for row in rows:
+    gpus = {}
+    for row in query.splitlines():
+        if not row.strip():
+            continue
         fields = [item.strip() for item in row.split(",")]
-        require(len(fields) == 3, f"unexpected nvidia-smi row: {row}")
-        require("CMP 170HX" in fields[1], f"unexpected GPU: {fields[1]}")
-        require(int(fields[2]) >= 61440, f"GPU {fields[0]} exposes under 60 GiB")
+        require(len(fields) == 4, f"unexpected nvidia-smi row: {row}")
+        gpus[fields[0]] = fields
+    expected = int(os.environ.get("PP_SIZE", "10")) * int(os.environ.get("TP_SIZE", "1"))
+    # CUDA_VISIBLE_DEVICES may select a subset of the host's cards (PP=8 leaves
+    # GPU 6 out). Its indices only match nvidia-smi's under PCI bus ordering.
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        selected = [item.strip() for item in visible.split(",") if item.strip()]
+        require(
+            os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" or len(selected) == len(gpus),
+            "a GPU subset in CUDA_VISIBLE_DEVICES needs CUDA_DEVICE_ORDER=PCI_BUS_ID",
+        )
+    else:
+        selected = list(gpus)
+    require(len(selected) == expected, f"expected {expected} visible GPUs, found {len(selected)}")
+    require(len(set(selected)) == len(selected), f"duplicate GPU in CUDA_VISIBLE_DEVICES={visible}")
+    for index in selected:
+        require(index in gpus, f"GPU {index} not present (nvidia-smi lists {','.join(gpus)})")
+        fields = gpus[index]
+        require("CMP 170HX" in fields[2], f"unexpected GPU: {fields[2]}")
+        require(int(fields[3]) >= 61440, f"GPU {fields[0]} exposes under 60 GiB")
 
     if require_idle:
+        buses = {gpus[index][1].lower() for index in selected}
         processes = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-compute-apps=pid,process_name",
+                "--query-compute-apps=gpu_bus_id,pid,process_name",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
         ).strip()
-        require(not processes, f"GPUs are busy; refusing to launch:\n{processes}")
+        busy = [line for line in processes.splitlines()
+                if line.split(",")[0].strip().lower() in buses]
+        require(not busy, "GPUs are busy; refusing to launch:\n" + "\n".join(busy))
 
 
 def main() -> None:
@@ -197,7 +235,7 @@ def main() -> None:
     parser.add_argument(
         "--partition", default=os.environ.get("VLLM_PP_LAYER_PARTITION", "10,8,8,8,8,8,8,8,8,4")
     )
-    parser.add_argument("--host", action="store_true", help="also validate the ten-GPU host")
+    parser.add_argument("--host", action="store_true", help="also validate the PP x TP GPU host")
     parser.add_argument("--require-idle", action="store_true")
     args = parser.parse_args()
 
@@ -212,8 +250,9 @@ def main() -> None:
         revision_file.read_text().strip() == DRAFT_REVISION,
         f"drafter revision must be {DRAFT_REVISION}",
     )
-    partition = validate_partition(target, args.partition)
-    validate_engine(args.engine.resolve())
+    engine = args.engine.resolve()
+    partition = validate_partition(target, args.partition, engine_has_topk_relay(engine))
+    validate_engine(engine)
     if args.host or args.require_idle:
         validate_gpu_host(args.require_idle)
     print(

@@ -1,8 +1,8 @@
-# GLM-5.3 + DFlash2 on 10x CMP 170HX (sm_80), vLLM 0.30
+# GLM-5.3 + DFlash2 on 8-10x CMP 170HX (sm_80), vLLM 0.30
 
 Serving recipe for the 78-layer GLM-5.3 DSA MoE (`GLM-5.3-Int4-Int8Mix-AWQ-g64`)
 with the `incoai/GLM-5.3-DFlash2` speculative drafter on ten 64-GiB CMP 170HX
-cards (Ampere, sm_80, PCIe), pipeline parallel 10.
+cards (Ampere, sm_80, PCIe), pipeline parallel 8, 9 or 10 (`PP_SIZE`).
 
 It pins the Morrowmake CMP 170HX vLLM fork (`versions.env`) and applies a small,
 fail-closed set of source patches (`apply_engine_patch.py`) that the fork
@@ -12,9 +12,9 @@ lacks for this target on Ampere.
 |---|---|
 | Engine | `Morrowmake/vllm-cmp170hx` @ `ampere-glm53` (vLLM 0.30.1rc1), pinned commit |
 | Torch | 2.13.0 + CUDA 13.0 |
-| Parallelism | PP=10, TP=1, partition `10,8,8,8,8,8,8,8,8,4` |
+| Parallelism | PP=8 (default), 9 or 10, TP=1; see [Pipeline depth](#pipeline-depth) |
 | KV cache | packed `fp8_ds_mla` (656 B/token/layer) + fp8 indexer keys, block 128 |
-| Context | 1,048,576 tokens; ~1.87M tokens of KV reported (2.09M pool) |
+| Context | 1,048,576 tokens per request at every PP size; KV pool depends on PP (below) |
 | Speculation | DFlash2, k=7, ~3.3-3.9 accepted tokens/step |
 | Decode (+250 MHz VF, 1350 MHz ceiling)| ~81-83 ms/step, ~41-49 tok/s single stream (FULL decode graphs); 174 tok/s aggregate at 8 streams |
 | Prefill | ~1.8-2.0K tok/s for one 8K prompt, ~2.4K tok/s at 32K or 8 concurrent |
@@ -101,6 +101,13 @@ checks the markers before launch.
   co-owns one MLA tensor on the last stage at disjoint block ids, its 16-token
   BF16 page padded to the 128-token MLA page. Without it the drafter is
   allocated full-length and caps KV at ~0.96M tokens. Requires `--block-size 128`.
+- **Top-k PP relay** (`local-cmp170hx-dsv32-topk-pp-relay`): a skip-topk
+  layer reuses the selections of the last index-producing layer. When a stage
+  starts on a skip-topk layer, the upstream stage sends its
+  `topk_indices_buffer` rows (int32, `[tokens, 2048]`, cloned) with the hidden
+  state, and this stage seeds its buffer from them. PP=8 and PP=9 need it,
+  because 78 layers cannot be split into 8 or 9 producer-aligned stages
+  without a ~60 GiB stage.
 - **Optional W8 lm_head** (`glm52_lmhead_quant.py`, `GLM52_LMHEAD_BITS=8`):
   off by default (~0.5 ms/step gain, small top-1 changes).
 
@@ -144,20 +151,41 @@ wheel and applies the patches. Nothing outside `~/vllm_glm53_dflash2` changes.
 ## Run
 
 ```bash
-./start.sh                    # production: agent profile on 0.0.0.0:8000, background
+./start.sh                    # production: agent profile on 127.0.0.1:8002, background
                               # logs/serve.log, logs/vllm.pid
 ./smoke.sh                    # health + one chat request
 ./stop.sh                     # stops only the recorded process group
 PROFILE=agent ./serve.sh      # foreground equivalent
+PP_SIZE=10 ./start.sh         # pipeline depth: 8 (default), 9 or 10
 ```
+
+### Pipeline depth
+
+| `PP_SIZE` | GPUs (`nvidia-smi` index) | Partition | `GPU_UTIL` | KV pool (tokens) |
+|---|---|---|---|---|
+| 8 (default) | 0-5, 7, 8 | `11,10,10,10,10,10,9,8` | 0.96 | 1,025,573 |
+| 9 | 0-8 | `10,9,9,9,9,9,9,8,6` | 0.93 | 1,600,895 |
+| 10 | 0-9 | `10,8,8,8,8,8,8,8,8,4` | 0.93 | ~2.09M |
+
+- `serve.sh` sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the indices match
+  `nvidia-smi`. PP=8 leaves GPU 6 free. Pass `CUDA_VISIBLE_DEVICES` to choose
+  other cards.
+- PP=8 and PP=9 have stages that start on skip-topk layers. They need the
+  top-k PP relay. Preflight checks for its marker and refuses those
+  partitions without it.
+- `CUDA_VISIBLE_DEVICES`, `VLLM_PP_LAYER_PARTITION`, `GPU_UTIL` and `MAX_LEN`
+  all override the defaults. Any other `PP_SIZE` (e.g. `PP_SIZE=5 TP_SIZE=2`)
+  must set `VLLM_PP_LAYER_PARTITION`.
+- Preflight checks only the selected cards, so `--require-idle` ignores
+  work on cards outside the set.
 
 | Profile | Context | Seqs | Batched tokens | Graphs | Bind |
 |---|---|---|---|---|---|
 | `smoke` (`serve.sh` default) | 32K | 1 | 1024 | eager | 127.0.0.1:8001 |
-| `agent` (`start.sh` default) | 1,048,576 | 4 | 512 | FULL + PIECEWISE | 0.0.0.0:8000 |
+| `agent` (`start.sh` default) | 1,048,576 | 4 | 512 | FULL + PIECEWISE | 127.0.0.1:8002 |
 | `production` | 1,048,576 | 8 | 2048 | FULL + PIECEWISE | 127.0.0.1:8001 |
 
-Useful switches (environment): `MODEL`, `DFLASH_MODEL`, `MAX_LEN`, `MAX_SEQS`,
+Useful switches (environment): `PP_SIZE`, `TP_SIZE`, `MODEL`, `DFLASH_MODEL`, `MAX_LEN`, `MAX_SEQS`,
 `MAX_BATCHED`, `EAGER=1`, `COMPILATION_CONFIG` (JSON), `SPEC_TOKENS`,
 `NO_SPEC=1`, `ENABLE_FORK_PP_OPT`, `ASYNC_SCHED=0` (A/B only),
 `PIN_NORMS=0`, `ALLOW_BUSY_GPUS=1` (skip the idle-GPU preflight).
