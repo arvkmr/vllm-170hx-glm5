@@ -28,7 +28,7 @@ export TP_SIZE=${TP_SIZE:-1}
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # Defaults to the first PP_SIZE x TP_SIZE cards; set CUDA_VISIBLE_DEVICES to
 # pick others (e.g. 0,1,2,3,4,5,7,8 to keep GPU 6 free).
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((PP_SIZE * TP_SIZE - 1)))}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$(seq 0 $((PP_SIZE * TP_SIZE - 1)) | paste -sd, -)}
 case "$PP_SIZE" in
   # 8 stages: ~5.0 GiB of weights per MoE layer, so the six 10-layer stages
   # (~50.2 GiB) bound the KV pool. Stage 0 carries the 3 dense layers and the
