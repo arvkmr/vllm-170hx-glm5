@@ -1,6 +1,6 @@
 """Quantize the target lm_head to Marlin W8A16/W4A16 at load (GLM52_LMHEAD_BITS).
 
-Ported from the earlier vLLM 0.26 recipe to the fork's current
+Ported from the v0.26 stack (patch_lmhead_quant.py) to the fork's current
 Marlin API. Every decode step projects hidden states through the full
 154880x6144 BF16 lm_head twice on the last pipeline stage: the target's
 verify rows and the DFlash2 drafter's candidate pass, which aliases the same

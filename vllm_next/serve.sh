@@ -12,44 +12,6 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export CUDA_HOME
 export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
 
-# Pipeline depth: PP_SIZE=8, 9 or 10 (default 8, current production).
-#   10  all ten cards, every stage starts on an index-producing layer.
-#   9   one card short (since 2026-10-03, serial 1322421041986 pulled).
-#   8   eight cards (since 2026-10-05).
-# 9 and 8 need the engine's top-k PP relay (local-cmp170hx-dsv32-topk-pp-relay,
-# applied by install.sh); preflight refuses their partitions without it.
-# Any other PP_SIZE (e.g. PP_SIZE=5 TP_SIZE=2) needs VLLM_PP_LAYER_PARTITION.
-# PP_SIZE x TP_SIZE must equal the visible GPU count; consecutive devices form
-# a TP group (0,1), (2,3), ... which are the same-host-bridge pairs here.
-export PP_SIZE=${PP_SIZE:-8}
-export TP_SIZE=${TP_SIZE:-1}
-# Number devices in nvidia-smi (PCI bus) order so the indices below name the
-# same cards nvidia-smi does; CUDA's default order differs on this host.
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-# Defaults to the first PP_SIZE x TP_SIZE cards; set CUDA_VISIBLE_DEVICES to
-# pick others (e.g. 0,1,2,3,4,5,7,8 to keep GPU 6 free).
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$(seq 0 $((PP_SIZE * TP_SIZE - 1)) | paste -sd, -)}
-case "$PP_SIZE" in
-  # 8 stages: ~5.0 GiB of weights per MoE layer, so the six 10-layer stages
-  # (~50.2 GiB) bound the KV pool. Stage 0 carries the 3 dense layers and the
-  # last stage lm_head + drafter (~8.6 GiB), hence 11 and 8. Stages 11, 21, 31,
-  # 41, 51, 61 begin on skip-topk layers (top-k PP relay). At 0.93 the pool
-  # is only 759K tokens (5.35 GiB KV per 10-layer stage), short of the
-  # gateway's 512K + 2x256K; 0.96 adds ~1.9 GiB per card (pool 1,025,573).
-  8) DEFAULT_PARTITION=11,10,10,10,10,10,9,8; GPU_UTIL=${GPU_UTIL:-0.96} ;;
-  # 9 stages need the top-k PP relay (stages 19, 28, 37, 55, 64, 72 begin on
-  # skip-topk layers). Nine MoE layers on stages 1-6 bound the KV pool
-  # (1,600,895 tokens at 0.93).
-  9) DEFAULT_PARTITION=10,9,9,9,9,9,9,8,6 ;;
-  10) DEFAULT_PARTITION=10,8,8,8,8,8,8,8,8,4 ;;
-  *)
-    if [ -z "${VLLM_PP_LAYER_PARTITION:-}" ]; then
-      echo "serve: PP_SIZE=$PP_SIZE has no default partition; use 8, 9 or 10, or set VLLM_PP_LAYER_PARTITION" >&2
-      exit 2
-    fi ;;
-esac
-export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-$DEFAULT_PARTITION}
-
 case "$PROFILE" in
   smoke)
     MAX_LEN=${MAX_LEN:-32768}; MAX_SEQS=${MAX_SEQS:-1}; MAX_BATCHED=${MAX_BATCHED:-1024}; EAGER=${EAGER:-1} ;;
@@ -64,15 +26,46 @@ case "$PROFILE" in
     # each costing a whole 128-token pool block; 512 halves that (~900 vs
     # ~1666 pool blocks per running request) and is what v0.26 measured as
     # better agent TTFT.
-    # Full 1M at every PP size. Per-deployment request limits (e.g. 512K to
-    # match a gateway window) belong in the caller's MAX_LEN, not here.
-    MAX_LEN=${MAX_LEN:-1048576}; MAX_SEQS=${MAX_SEQS:-4}; MAX_BATCHED=${MAX_BATCHED:-512}; EAGER=${EAGER:-0}
+    # MAX_LEN 512K since 2026-10-03 (PP=9): the pool is ~1.14M tokens, so no
+    # single request may take 1M. The gateway's largest window is 512K.
+    MAX_LEN=${MAX_LEN:-524288}; MAX_SEQS=${MAX_SEQS:-4}; MAX_BATCHED=${MAX_BATCHED:-512}; EAGER=${EAGER:-0}
     # Private since 2026-09-30: the vision proxy (~/vision_sidecar/proxy.py)
     # owns the public 0.0.0.0:8000 and forwards here.
     ENABLE_FORK_PP_OPT=${ENABLE_FORK_PP_OPT:-1}; HOST=${HOST:-127.0.0.1}; PORT=${PORT:-8002} ;;
   *) echo "serve: PROFILE must be smoke, agent or production" >&2; exit 2 ;;
 esac
 
+# PP_SIZE x TP_SIZE must equal the visible GPU count; consecutive devices form
+# a TP group (0,1), (2,3), ... which are the same-host-bridge pairs here.
+# PP=9 since 2026-10-03: serial 1322421041986 was pulled after falling off the
+# bus twice. Set PP_SIZE=10 again once a tenth card is in.
+# PP=8 since 2026-10-05: GPU 6 (83:00.0, serial 1322321007949) is left out.
+# PP_SIZE=9 brings back the PP=9 layout (or run
+# rollback-pp9-20261005/rollback.sh to restore every PP=9 file).
+export PP_SIZE=${PP_SIZE:-8}
+export TP_SIZE=${TP_SIZE:-1}
+# Number devices in nvidia-smi (PCI bus) order so the indices below name the
+# same cards nvidia-smi does; CUDA's default order differs on this host.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+case "$PP_SIZE" in
+  8) DEFAULT_DEVICES=0,1,2,3,4,5,7,8 ;;
+  *) DEFAULT_DEVICES=$(seq -s, 0 $((PP_SIZE * TP_SIZE - 1))) ;;
+esac
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$DEFAULT_DEVICES}
+case "$PP_SIZE" in
+  # 8 stages: ~5.0 GiB of weights per MoE layer, so the six 10-layer stages
+  # (~50.2 GiB) bound the KV pool. Stage 0 carries the 3 dense layers and the
+  # last stage lm_head + drafter (~8.6 GiB), hence 11 and 8. Stages 11, 21, 31,
+  # 41, 51, 61 begin on skip-topk layers (top-k PP relay). At 0.93 the pool
+  # is only 759K tokens (5.35 GiB KV per 10-layer stage), short of the
+  # gateway's 512K + 2x256K; 0.96 adds ~1.9 GiB per card.
+  8) DEFAULT_PARTITION=11,10,10,10,10,10,9,8; GPU_UTIL=${GPU_UTIL:-0.96} ;;
+  # 9 stages need the top-k PP relay (stages 19, 28, 37, 55, 64, 72 begin on
+  # skip-topk layers). Nine MoE layers on stages 1-6 bound the KV pool.
+  9) DEFAULT_PARTITION=10,9,9,9,9,9,9,8,6 ;;
+  *) DEFAULT_PARTITION=10,8,8,8,8,8,8,8,8,4 ;;
+esac
+export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-$DEFAULT_PARTITION}
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$ROOT/cache/vllm}
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$ROOT/cache/torchinductor}
 export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-$ROOT/cache}

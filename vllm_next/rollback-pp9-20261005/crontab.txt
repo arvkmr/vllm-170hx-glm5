@@ -1,0 +1,2 @@
+* * * * * /home/arveen/vllm_install/vllm_next/glm-watchdog.sh
+* * * * * /home/arveen/vllm_install/vllm_next/server-alert.py

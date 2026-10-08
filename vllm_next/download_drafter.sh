@@ -12,7 +12,7 @@ fi
 ROOT=${VLLM_NEXT_ROOT:-$HOME/vllm_glm53_dflash2}
 VENV=${VLLM_NEXT_VENV:-$ROOT/venv}
 DEST=${DFLASH_MODEL:-$HOME/models/GLM-5.3-DFlash2}
-[ -x "$VENV/bin/hf" ] || { echo "download: run ./install.sh first" >&2; exit 1; }
+[ -x "$VENV/bin/hf" ] || { echo "download: run vllm_next/install.sh first" >&2; exit 1; }
 mkdir -p "$DEST"
 "$VENV/bin/hf" download "$DFLASH_REPO" --revision "$DFLASH_REVISION" --local-dir "$DEST"
 printf '%s\n' "$DFLASH_REVISION" >"$DEST/.pinned-revision"

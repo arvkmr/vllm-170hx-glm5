@@ -1,19 +1,6 @@
-# ALLOWLIST, not a denylist. Everything is ignored by default and only source
-# is re-included, so runtime artifacts (logs/ holds full command lines, which
-# can carry tokens) can never be committed by accident. Git does not descend
-# into an ignored directory, so these negations only re-include root files.
-*
-
-!.gitignore
-!README.md
-!*.py
-!*.sh
-!*.env
-!*.service
-
-# Belt and braces: named explicitly so they stay out even if the rules above
-# are ever loosened to allow subdirectories.
+# Runtime artifacts never belong here (logs/ holds full command lines).
 logs/
 cache/
 __pycache__/
 .DS_Store
+*.bak-*

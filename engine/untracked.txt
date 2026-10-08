@@ -1,0 +1,5 @@
+.glm53-dflash2-local-patch
+vllm/_glm52_lmhead_quant.py
+vllm/_glm52_mla_bmm.py
+vllm/_glm52_mla_fp8.py
+vllm/_glm52_topk_canon.py

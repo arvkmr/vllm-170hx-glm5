@@ -1,0 +1,1070 @@
+diff --git a/vllm/ampere_decode/__init__.py b/vllm/ampere_decode/__init__.py
+index 3425b1436..232be4d7e 100644
+--- a/vllm/ampere_decode/__init__.py
++++ b/vllm/ampere_decode/__init__.py
+@@ -442,11 +442,15 @@ def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
+         return False
+     if getattr(router, "eplb_state", None) is not None:
+         return False
+-    bias = getattr(router, "e_score_correction_bias", None)
+-    if bias is None or bias.dtype != torch.float32 or tuple(bias.shape) != (288,):
+-        return False
++    # local-cmp170hx-route-v2-dsa: also GLM-5.3's 256 x 6144 router.
+     w = getattr(gate, "weight", None)
+-    if w is None or w.dtype != torch.bfloat16 or tuple(w.shape) != (288, 4096):
++    if w is None or w.dtype != torch.bfloat16 or tuple(w.shape) not in (
++        (288, 4096), (256, 6144)
++    ):
++        return False
++    _route_e, _route_k = (int(d) for d in w.shape)
++    bias = getattr(router, "e_score_correction_bias", None)
++    if bias is None or bias.dtype != torch.float32 or tuple(bias.shape) != (_route_e,):
+         return False
+     if not w.is_contiguous():
+         return False
+@@ -454,7 +458,7 @@ def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
+         return False
+     if getattr(gate, "out_dtype", None) != torch.float32:
+         return False
+-    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != 4096:
++    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != _route_k:
+         return False
+     if x.stride(1) != 1:
+         return False
+diff --git a/vllm/ampere_decode/warmup.py b/vllm/ampere_decode/warmup.py
+index fa3ca20ac..2b3d346d7 100644
+--- a/vllm/ampere_decode/warmup.py
++++ b/vllm/ampere_decode/warmup.py
+@@ -259,7 +259,8 @@ def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
+         return
+     num_experts, topk = shape
+     hidden = int(worker.vllm_config.model_config.get_hidden_size())
+-    if (num_experts, topk, hidden) != (288, 8, 4096):
++    # local-cmp170hx-route-v2-dsa: also GLM-5.3's 256 x 6144 router.
++    if (num_experts, topk, hidden) not in ((288, 8, 4096), (256, 8, 6144)):
+         return
+     ms = _token_sizes(capture_sizes, envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS)
+     if not ms:
+diff --git a/vllm/ampere_thin_gemm/__init__.py b/vllm/ampere_thin_gemm/__init__.py
+index b11ecd257..9555b02af 100644
+--- a/vllm/ampere_thin_gemm/__init__.py
++++ b/vllm/ampere_thin_gemm/__init__.py
+@@ -99,7 +99,10 @@ def dispatch_threshold() -> int:
+ # parallel, where kda_o_proj runs at full width (K = 64 heads * 128): past
+ # M = 16 no thin-M schedule beats cuBLAS on it (M=24 46.7 vs 46.0 us, M=32
+ # 49.3 vs 46.3 us, best of the sweep). No TP=4 shape is listed.
+-_CUBLAS_FROM_M: dict[tuple[int, int], int] = {(4096, 8192): 17}
++# local-cmp170hx-thin-gemm-dsa: GLM-5.3 shapes where cuBLAS wins.
++_CUBLAS_FROM_M: dict[tuple[int, int], int] = {
++    (4096, 8192): 17, (24576, 6144): 1, (6144, 36864): 17,
++}
+ 
+ 
+ def thin_gemm_supported(
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 50b7934f4..6c5114275 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -360,6 +360,10 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
+     kv_cache_dtype: CacheDType,
+ ) -> CacheDType:
+     backend_name = attn_backend.get_name()
++    if backend_name == "TRITON_MLA_SPARSE" and kv_cache_dtype in (
++        "fp8", "fp8_e4m3", "fp8_ds_mla"
++    ):
++        return "fp8_ds_mla"
+     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+         # The NVFP4 DS-MLA format is used as-is; any other quantized dtype
+         # (fp8, fp8_e4m3, ...) is served via the fp8_ds_mla format.
+@@ -1166,7 +1170,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                     # contiguous; a NoPE model (qk_rope_head_dim == 0) then
+                     # needs no concat at all.
+                     mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
+-                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
++                    # local-cmp170hx-mla-head-bmm
++                    from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm
++
++                    _glm52_head_bmm(mqa_q_nope, W_UK_T, mqa_ql_nope.transpose(0, 1))
+ 
+             if fp8_attention and self.impl.supports_quant_query_input:
+                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+@@ -1392,9 +1399,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                 )
+         else:
+             # Convert from (L, N, V) to (N, L, V)
+-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
++            # local-cmp170hx-mla-head-bmm: contiguous per-head blocks.
++            replace_parameter(
++                self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True
++            )
+             # Convert from (L, N, P) to (N, P, L)
+-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
++            replace_parameter(
++                self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True
++            )
+             if self.dcp_q_replicate:
+                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
+                     self.W_UK_T.contiguous(), dim=0
+@@ -1484,7 +1496,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             )
+         else:
+             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
+-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
++            # local-cmp170hx-mla-head-bmm
++            from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm
++
++            _glm52_head_bmm(x, self.W_UV, out.transpose(0, 1))
+ 
+ 
+ def unified_mla_kv_cache_update(
+diff --git a/vllm/model_executor/layers/indexer_topk.py b/vllm/model_executor/layers/indexer_topk.py
+index 418ea0ca0..450314ed4 100644
+--- a/vllm/model_executor/layers/indexer_topk.py
++++ b/vllm/model_executor/layers/indexer_topk.py
+@@ -3,6 +3,7 @@
+ """Top-k kernels for the DSA sparse attention indexer."""
+ 
+ import functools
++import os
+ 
+ import torch
+ 
+@@ -546,6 +547,10 @@ def canonical_topk(
+ # ---------------------------------------------------------------------------
+ 
+ 
++# local-cmp170hx-canon-topk
++_GLM53_TOPK_CANON = os.environ.get("GLM53_TOPK_CANON", "0") == "1"
++
++
+ @functools.cache
+ def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
+     return SparseIndexerTopk(backend)
+@@ -702,6 +707,15 @@ class SparseIndexerTopk(torch.nn.Module):
+         self._run_backend(
+             logits, seq_lens, next_n, topk_indices, topk_tokens, max_seq_len
+         )
++        if _GLM53_TOPK_CANON:
++            from vllm._glm52_topk_canon import canon_topk_indices
++
++            canon_topk_indices(
++                logits,
++                topk_indices,
++                self._row_ends(seq_lens, next_n, logits.shape[0]),
++            )
++            return
+         if use_tiefix_topk():
+             tiefix_topk_(
+                 logits,
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index ae45b77dc..d3b70939d 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -33,7 +33,26 @@ from vllm.utils.deep_gemm import (
+     fp8_fp4_mqa_logits,
+     fp8_fp4_paged_mqa_logits,
+     has_deep_gemm,
++    is_deep_gemm_supported,
+ )
++# local-cmp170hx-dsv32-sm80-indexer: Ampere scores with the fork's Triton kernels.
++from vllm.model_executor.layers.indexer_topk import (
++    canonical_topk,
++    repair_topk_ties_,
++    sort_selected_topk_,
++    tiefix_topk_,
++    use_canonical_topk,
++    use_sorted_topk,
++    use_tiefix_topk,
++    use_topk_tie_repair,
++)
++from vllm.v1.attention.ops.triton_mqa_logits import (
++    fp8_mqa_logits as triton_fp8_mqa_logits,
++    fp8_paged_mqa_logits as triton_fp8_paged_mqa_logits,
++)
++import os as _os
++from vllm._glm52_topk_canon import canon_topk_indices_prefill
++_GLM53_TOPK_CANON = _os.environ.get("GLM53_TOPK_CANON", "0") == "1"
+ from vllm.utils.import_utils import has_cutedsl
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+@@ -579,6 +598,17 @@ def sparse_attn_indexer(
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                     )
++                elif current_platform.is_cuda() and not is_deep_gemm_supported():
++                    # Ampere: Triton kernel dequantizing the e4m3 bytes
++                    # in-kernel (bf16 MMA, fp32 accumulate).
++                    assert not use_fp4_cache, "MXFP4 indexer needs DeepGEMM"
++                    logits = triton_fp8_mqa_logits(
++                        q_slice_cast,
++                        (k_quant_cast, k_scale_cast),
++                        weights[chunk.token_start : chunk.token_end],
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                    )
+                 else:
+                     logits = fp8_fp4_mqa_logits(
+                         (q_slice_cast, q_scale_slice),
+@@ -613,16 +643,67 @@ def sparse_attn_indexer(
+                             chunk_candidates,
+                             candidate_block_size,
+                         )
+-                ops.top_k_per_row_prefill(
+-                    logits,
+-                    cu_seqlen_ks,
+-                    cu_seqlen_ke,
+-                    topk_indices,
+-                    num_rows,
+-                    logits.stride(0),
+-                    logits.stride(1),
+-                    topk_tokens,
+-                )
++                if _GLM53_TOPK_CANON:
++                    # local-cmp170hx-canon-topk: native value-exact selection, then
++                    # v0.26's Triton canonical rebuild (relative indices,
++                    # identity short rows), written out of place.
++                    ops.top_k_per_row_prefill(
++                        logits,
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        topk_indices,
++                        num_rows,
++                        logits.stride(0),
++                        logits.stride(1),
++                        topk_tokens,
++                    )
++                    canon_topk_indices_prefill(
++                        logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke, topk_tokens
++                    )
++                elif use_canonical_topk():
++                    # The prefill selection decides what each token attends
++                    # while the KV cache is built; a tie lottery here makes
++                    # the cache itself irreproducible (as glm5next).
++                    canonical_topk(
++                        logits,
++                        topk_tokens,
++                        row_starts=cu_seqlen_ks,
++                        row_ends=cu_seqlen_ke,
++                        out=topk_indices,
++                        relative=True,
++                        identity_when_short=True,
++                    )
++                else:
++                    ops.top_k_per_row_prefill(
++                        logits,
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        topk_indices,
++                        num_rows,
++                        logits.stride(0),
++                        logits.stride(1),
++                        topk_tokens,
++                    )
++                    if use_tiefix_topk():
++                        tiefix_topk_(
++                            logits,
++                            topk_indices,
++                            row_starts=cu_seqlen_ks,
++                            row_ends=cu_seqlen_ke,
++                            relative=True,
++                            sort=use_sorted_topk(),
++                        )
++                    elif use_topk_tie_repair():
++                        repair_topk_ties_(
++                            topk_indices,
++                            logits,
++                            topk_tokens,
++                            row_ends=cu_seqlen_ke,
++                            row_starts=cu_seqlen_ks,
++                            relative=True,
++                        )
++                    elif use_sorted_topk():
++                        sort_selected_topk_(topk_indices)
+ 
+             if deinterleave_idx is None:
+                 # Under the PCP path the top-k already ran over the whole
+@@ -679,6 +760,15 @@ def sparse_attn_indexer(
+                 padded_q_scale = pack_seq_triton(
+                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
+                 )
++            elif current_platform.is_cuda() and not is_deep_gemm_supported():
++                # Ampere Triton cannot load an fp8 pointer: pack the e4m3
++                # bytes. Zero pads score zero and context_lens masks them.
++                padded_q_quant_decode_tokens = pack_seq_triton(
++                    q_quant[:num_decode_tokens].view(torch.uint8),
++                    decode_lens,
++                    pad_value=0,
++                )
++                padded_q_scale = None
+             else:
+                 padded_q_quant_decode_tokens = pack_seq_triton(
+                     q_quant[:num_decode_tokens], decode_lens
+@@ -722,6 +812,24 @@ def sparse_attn_indexer(
+                 decode_metadata.schedule_metadata,
+                 max_model_len,
+             )
++        elif current_platform.is_cuda() and not is_deep_gemm_supported():
++            assert padded_q_scale is None, "MXFP4 indexer needs DeepGEMM"
++            # One weights row per padded Q row: pack them the same way.
++            if needs_padded_path and num_decode_tokens > 0:
++                decode_weights = pack_seq_triton(
++                    weights[:num_decode_tokens], decode_lens, pad_value=0
++                ).reshape(-1, weights.shape[-1])
++            else:
++                decode_weights = weights[:num_padded_tokens]
++            logits = triton_fp8_paged_mqa_logits(
++                padded_q_quant_cast,
++                kv_cache,
++                decode_weights,
++                seq_lens,
++                decode_metadata.block_table,
++                max_model_len,
++                max_seq_len=attn_metadata_narrowed.max_seq_len,
++            )
+         else:
+             logits = fp8_fp4_paged_mqa_logits(
+                 (padded_q_quant_cast, padded_q_scale),
+@@ -911,10 +1019,13 @@ class SparseAttnIndexer(CustomOp):
+                 _UNPACK_SEQ_TRITON_KERNEL,
+             )
+ 
+-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
++            pack_bytes = use_fp4_cache or (
++                current_platform.is_cuda() and not is_deep_gemm_supported()
++            )
++            pack_dtype = torch.uint8 if pack_bytes else current_platform.fp8_dtype()
+             _PACK_SEQ_TRITON_KERNEL.register_warmup(
+                 dtype=pack_dtype,
+-                pad_value=0 if use_fp4_cache else -float("inf"),
++                pad_value=0 if pack_bytes else -float("inf"),
+             )
+             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
+ 
+diff --git a/vllm/models/deepseek_v32/attention.py b/vllm/models/deepseek_v32/attention.py
+index e6fb00434..71dbd0f37 100644
+--- a/vllm/models/deepseek_v32/attention.py
++++ b/vllm/models/deepseek_v32/attention.py
+@@ -33,6 +33,8 @@ from vllm.model_executor.models.deepseek_v2 import (
+ )
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
++# local-cmp170hx-mla-head-bmm: also registers torch.ops.vllm.glm52_head_bmm_new.
++from vllm._glm52_mla_bmm import head_bmm as _glm52_head_bmm
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import is_quantized_kv_cache
+ from vllm.v1.attention.ops.pcp import (
+@@ -404,7 +406,10 @@ class DeepseekV32Attention(MLAAttention):
+ 
+         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+-        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
++        # local-cmp170hx-mla-head-bmm
++        ql_nope = torch.ops.vllm.glm52_head_bmm_new(
++            q_nope.transpose(0, 1), self.W_UK_T
++        ).transpose(0, 1)
+ 
+         if self.indexer is not None and not self.skip_topk:
+             index_q = self.indexer.wq_b(q_c)[0]
+@@ -623,6 +628,7 @@ class DeepseekV32Attention(MLAAttention):
+             .view(num_actual, self.num_local_heads, self.v_head_dim)
+             .transpose(0, 1)
+         )
+-        torch.bmm(x, self.W_UV, out=out)
++        # local-cmp170hx-mla-head-bmm
++        _glm52_head_bmm(x, self.W_UV, out)
+         if self.use_pcp and num_actual < output.shape[0]:
+             output[num_actual:].zero_()
+diff --git a/vllm/models/deepseek_v32/common/kernels.py b/vllm/models/deepseek_v32/common/kernels.py
+index e0259c46f..f13321de9 100644
+--- a/vllm/models/deepseek_v32/common/kernels.py
++++ b/vllm/models/deepseek_v32/common/kernels.py
+@@ -7,6 +7,7 @@ import torch
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import is_quantized_kv_cache
++from vllm.v1.attention.ops.triton_e4m3 import f32_to_e4m3_bits
+ 
+ # Cache of tiny 1-element dummy tensors (per device, dtype) reused by the
+ # has_indexer=False path so the indexer args don't allocate every call.
+@@ -23,6 +24,22 @@ _INDEXER_CACHE_HEAD_TILE_BYTES = 16
+ _FP8_DTYPE = current_platform.fp8_dtype()
+ _USE_FNUZ = torch.float8_e4m3fnuz == _FP8_DTYPE
+ _FP8_MAX = 224.0 if _USE_FNUZ else 448.0
++# local-cmp170hx-dsv32-sm80-fp8: Triton names e4m3 natively only on SM89+; below
++# that the kernels write software-rounded e4m3 bits through byte views.
++_FP8_NATIVE = (
++    _USE_FNUZ
++    or not current_platform.is_cuda()
++    or current_platform.has_device_capability(89)
++)
++_FP8_NATIVE_TL = tl.constexpr(_FP8_NATIVE)
++
++
++def _as_fp8_bytes(t: torch.Tensor | None) -> torch.Tensor | None:
++    if _FP8_NATIVE or t is None:
++        return t
++    if t.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
++        return t.view(torch.uint8)
++    return t
+ 
+ 
+ def _dummy(shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+@@ -58,6 +75,15 @@ def _get_cos_sin(
+     return cos, sin
+ 
+ 
++@triton.jit
++def _to_fp8(x, USE_FNUZ: tl.constexpr):
++    if _FP8_NATIVE_TL:
++        y = x.to(tl.float8e4b8 if USE_FNUZ else tl.float8e4nv)
++    else:
++        y = f32_to_e4m3_bits(x.to(tl.float32))
++    return y
++
++
+ @triton.jit
+ def _fp8_ue8m0_quantize(vals, FP8_MAX: tl.constexpr, USE_FNUZ: tl.constexpr):
+     """Quantize float32 values to FP8 E4M3 with a ue8m0 (power-of-2) scale.
+@@ -69,7 +95,7 @@ def _fp8_ue8m0_quantize(vals, FP8_MAX: tl.constexpr, USE_FNUZ: tl.constexpr):
+     scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+     scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale)))
+     fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+-    fp8_vals = tl.div_rn(vals, scale).to(fp8_dtype)
++    fp8_vals = _to_fp8(tl.div_rn(vals, scale), USE_FNUZ)
+     return fp8_vals, scale
+ 
+ 
+@@ -364,7 +390,7 @@ def _fused_norm_rope_kernel(
+                 # concat_and_cache_ds_mla kernel; floored to FLT_MIN.
+                 tile_scale = tl.maximum(tile_amax * (1.0 / FP8_MAX), 1e-4)
+                 tile_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(tile_scale)))
+-                kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(fp8_dtype), (KV_DIM,))
++                kv_c_fp8 = tl.reshape(_to_fp8(kv_2d / tile_scale, USE_FNUZ), (KV_DIM,))
+                 tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
+                 tile_off = tl.arange(0, MLA_NUM_TILES)
+                 tl.store(
+@@ -384,16 +410,16 @@ def _fused_norm_rope_kernel(
+             # kv_c_normed (KV_DIM elements)
+             if MLA_CACHE_FP8:
+                 scale = tl.load(mla_cache_scale_ptr)
+-                kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)
++                kv_c_fp8 = _to_fp8(kv_c.to(tl.float32) / scale, USE_FNUZ)
+                 tl.store(dst + kv_block, kv_c_fp8)
+             else:
+                 tl.store(dst + kv_block, kv_c)
+             # k_pe_roped (from registers, interleaved layout)
+             if MLA_CACHE_FP8:
+-                tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(fp8_dtype))
++                tl.store(dst + KV_DIM + dim_off * 2, _to_fp8(r1 / scale, USE_FNUZ))
+                 tl.store(
+                     dst + KV_DIM + dim_off * 2 + 1,
+-                    (r2 / scale).to(fp8_dtype),
++                    _to_fp8(r2 / scale, USE_FNUZ),
+                 )
+             else:
+                 tl.store(dst + KV_DIM + dim_off * 2, r1)
+@@ -583,7 +609,7 @@ def fused_norm_rope(
+                 f"multiple of {_INDEXER_CACHE_BLOCK_TILE} for the shuffled layout"
+             )
+         idx_cache_stride = indexer_k_cache.stride(0)
+-        if indexer_k_cache.dtype == torch.uint8:
++        if indexer_k_cache.dtype == torch.uint8 and _FP8_NATIVE:
+             indexer_k_cache = indexer_k_cache.view(_FP8_DTYPE)
+         # The head tile is a byte count; the kernel indexes the cache in elements.
+         idx_cache_head_tile = (
+@@ -617,11 +643,11 @@ def fused_norm_rope(
+             mla_entry_stride = u8_cache.stride(1)
+             mla_ds_scale_view = u8_cache.view(torch.float32)
+             mla_ds_rope_view = u8_cache.view(torch.bfloat16)
+-            mla_kv_cache = u8_cache.view(_FP8_DTYPE)
++            mla_kv_cache = u8_cache.view(_FP8_DTYPE) if _FP8_NATIVE else u8_cache
+         else:
+             mla_block_stride = mla_kv_cache.stride(0)
+             mla_entry_stride = mla_kv_cache.stride(1)
+-            if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8:
++            if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8 and _FP8_NATIVE:
+                 mla_kv_cache = mla_kv_cache.view(_FP8_DTYPE)
+         if mla_k_scale is None:
+             mla_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+@@ -694,7 +720,7 @@ def fused_norm_rope(
+         # Cache params
+         slot_mapping,
+         indexer_slot_mapping,
+-        indexer_k_cache,
++        _as_fp8_bytes(indexer_k_cache),
+         idx_cache_scale_view,
+         idx_cache_block_size,
+         idx_cache_stride,
+@@ -702,7 +728,7 @@ def fused_norm_rope(
+         _INDEXER_CACHE_BLOCK_TILE,
+         idx_cache_head_tile,
+         # MLA KV cache (uses same slot_mapping)
+-        mla_kv_cache,
++        _as_fp8_bytes(mla_kv_cache),
+         mla_block_stride,
+         mla_entry_stride,
+         mla_block_size,
+@@ -810,7 +836,7 @@ def _fused_q_kernel(
+                     + ql_nope_off,
+                     mask=ql_nope_mask,
+                 ).to(tl.float32)
+-                ql_nope_fp8 = (ql_nope / scale).to(fp8_dtype)
++                ql_nope_fp8 = _to_fp8(ql_nope / scale, USE_FNUZ)
+                 tl.store(
+                     mqa_q_fp8_ptr
+                     + tok_idx * mqa_q_fp8_stride0
+@@ -860,7 +886,7 @@ def _fused_q_kernel(
+                         + q_head_idx * mqa_q_fp8_stride1
+                         + QL_NOPE_DIM
+                         + rot_off * 2,
+-                        (r1 / scale).to(fp8_dtype),
++                        _to_fp8(r1 / scale, USE_FNUZ),
+                     )
+                     tl.store(
+                         mqa_q_fp8_ptr
+@@ -869,7 +895,7 @@ def _fused_q_kernel(
+                         + QL_NOPE_DIM
+                         + rot_off * 2
+                         + 1,
+-                        (r2 / scale).to(fp8_dtype),
++                        _to_fp8(r2 / scale, USE_FNUZ),
+                     )
+                 else:
+                     # bf16 query: write the RoPE'd q_pe unquantized.
+@@ -1021,7 +1047,7 @@ def fused_q(
+             q_pe.shape[0],
+             q_pe.shape[1],
+             ql_nope.shape[2] + q_pe.shape[2],
+-            dtype=_FP8_DTYPE,
++            dtype=_FP8_DTYPE if _FP8_NATIVE else torch.uint8,
+             device=q_pe.device,
+         )
+         # Placeholder; pid 0 packs q_pe into mqa_q_fp8 instead.
+@@ -1033,7 +1059,9 @@ def fused_q(
+         mqa_q_fp8 = q_pe_out  # unused placeholder for the fp8 pack pointer
+         mqa_q = q_pe_out
+ 
+-    index_q_fp8 = torch.empty_like(index_q, dtype=_FP8_DTYPE)
++    index_q_fp8 = torch.empty_like(
++        index_q, dtype=_FP8_DTYPE if _FP8_NATIVE else torch.uint8
++    )
+     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+     if cutedsl_kernel is not None:
+         cutedsl_kernel(
+@@ -1075,20 +1103,20 @@ def fused_q(
+         index_q_cos_sin_cache,
+         index_q_cos_sin_cache.stride(0),
+         index_q_cos_sin_cache.shape[-1] // 2,
+-        index_q_fp8,
++        _as_fp8_bytes(index_q_fp8),
+         index_q_fp8.stride(0),
+         index_q_fp8.stride(1),
+         index_q_head_dim,
+         ql_nope,
+         ql_nope.stride(0),
+         ql_nope.stride(1),
+-        mqa_q_fp8,
++        _as_fp8_bytes(mqa_q_fp8),
+         mqa_q_fp8.stride(0),
+         mqa_q_fp8.stride(1),
+         q_scale,
+         ql_nope.shape[2],
+         triton.next_power_of_2(ql_nope.shape[2]),
+-        q_pe_out,
++        _as_fp8_bytes(q_pe_out),
+         q_pe_out.stride(0),
+         q_pe_out.stride(1),
+         index_weights,
+@@ -1108,6 +1136,11 @@ def fused_q(
+         # per-program compute bound (swept 1/2/4/8 — 1 wins or ties everywhere).
+         num_warps=1,
+     )
++    if not _FP8_NATIVE:
++        # Written as bytes above; callers get the float8 dtype.
++        index_q_fp8 = index_q_fp8.view(_FP8_DTYPE)
++        if quantize_mqa:
++            mqa_q = mqa_q.view(_FP8_DTYPE)
+     return index_q_fp8, index_weights_out, mqa_q
+ 
+ 
+diff --git a/vllm/models/deepseek_v32/nvidia/model.py b/vllm/models/deepseek_v32/nvidia/model.py
+index b42ba28c8..fbac0ead2 100644
+--- a/vllm/models/deepseek_v32/nvidia/model.py
++++ b/vllm/models/deepseek_v32/nvidia/model.py
+@@ -44,7 +44,9 @@ from vllm.models.common.ops.sequence_parallel import (
+     sp_reduce_scatter,
+     sp_shard,
+ )
++from vllm.model_executor.models.interfaces import EagleModelMixin
+ from vllm.models.deepseek_v32.attention import DeepseekV32Attention
++from vllm.model_executor.models.utils import spec_decode_needs_target_embed
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backends.mla.index_group import (
+     SparseMLAIndexGroupBuilder,
+@@ -166,8 +168,23 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
+         return hidden_states, residual
+ 
+ 
+-class DeepseekV32Model(torch.nn.Module):
++def _dsa_layer_skips_topk(config, layer_id: int) -> bool:
++    """Mirror of DeepseekV32Attention's skip-topk rule for a target layer."""
++    freq = getattr(config, "index_topk_freq", 1)
++    pattern = getattr(config, "index_topk_pattern", None)
++    offset = getattr(config, "index_skip_topk_offset", 2)
++    if pattern is None:
++        return max(layer_id - offset + 1, 0) % freq != 0
++    if 0 <= layer_id < len(pattern):
++        return pattern[layer_id] == "S"
++    return False
++
++
++class DeepseekV32Model(torch.nn.Module, EagleModelMixin):
+     fall_back_to_pt_during_load = False
++    # local-cmp170hx-dsv32-aux-pp: DFlash aux states are relayed across PP stages
++    # with the fork's EagleModelMixin slot layout (as llama.py does).
++    supports_aux_hidden_states_over_pp = True
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -200,7 +217,12 @@ class DeepseekV32Model(torch.nn.Module):
+             get_sparse_mla_index_group_max_rows(vllm_config),
+         )
+ 
+-        if get_pp_group().is_first_rank:
++        # The last stage also holds the table when a DFlash/EAGLE drafter
++        # runs there: the drafter ships no embedding and aliases the
++        # target's, which a PPMissingLayer cannot provide (as glm5next).
++        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(
++            vllm_config
++        ):
+             self.embed_tokens = make_input_embedding(
+                 config.vocab_size,
+                 config.hidden_size,
+@@ -231,6 +253,33 @@ class DeepseekV32Model(torch.nn.Module):
+         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+             ["hidden_states", "residual"], config.hidden_size
+         )
++        # local-cmp170hx-dsv32-topk-pp-relay: a skip-topk layer reads the selections of
++        # the most recent index-producing layer from the rank-local
++        # topk_indices_buffer. When a stage boundary falls inside such a run
++        # (e.g. PP=9 on 78 layers), the upstream stage sends its buffer along
++        # with the hidden state and this stage restores it before its first
++        # layer. The indices are logical (per-request token positions), so
++        # they mean the same on every rank; each rank converts them to
++        # physical slots with its own block table.
++        pp_group = get_pp_group()
++        self.topk_relay_in = not pp_group.is_first_rank and _dsa_layer_skips_topk(
++            config, self.start_layer
++        )
++        self.topk_relay_out = not pp_group.is_last_rank and _dsa_layer_skips_topk(
++            config, self.end_layer
++        )
++        if self.topk_relay_in:
++            make_empty_base = self.make_empty_intermediate_tensors
++            topk_width = config.index_topk
++
++            def make_empty_with_topk(batch_size, dtype, device):
++                tensors = make_empty_base(batch_size, dtype, device)
++                tensors["topk_indices"] = torch.full(
++                    (batch_size, topk_width), -1, dtype=torch.int32, device=device
++                )
++                return tensors
++
++            self.make_empty_intermediate_tensors = make_empty_with_topk
+ 
+         self.aux_hidden_state_layers = tuple[int, ...]()
+         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+@@ -268,6 +317,9 @@ class DeepseekV32Model(torch.nn.Module):
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
++            if self.topk_relay_in:  # local-cmp170hx-dsv32-topk-pp-relay
++                relayed_topk = intermediate_tensors["topk_indices"]
++                self.topk_indices_buffer[: relayed_topk.shape[0]].copy_(relayed_topk)
+ 
+         full_num_tokens = positions.shape[0]
+         if self.use_sequence_parallel:
+@@ -281,24 +333,44 @@ class DeepseekV32Model(torch.nn.Module):
+                 attn_in = sp_shard(attn_in)
+             assert residual is None, "Currently, SP is not supported with PP"
+ 
+-        aux_hidden_states = []
++        # Aux layer L is the stream entering layer L. Use the mixin's PP
++        # layout: the first rank records its start layer and every rank
++        # records idx + 1 after layer idx, so a layer on a stage boundary is
++        # recorded once, upstream, and relayed from there.
++        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++        aux_hidden_states: list[torch.Tensor] = []
++        if get_pp_group().is_first_rank:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, self.start_layer, hidden_states, residual
++            )
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
+-            if idx in self.aux_hidden_state_layers:
+-                aux_hidden_states.append(
+-                    hidden_states if residual is None else hidden_states + residual
+-                )
+             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
+             attn_in = None
++            self._maybe_add_hidden_state(
++                aux_hidden_states, idx + 1, hidden_states, residual
++            )
+ 
+         if not get_pp_group().is_last_rank:
+             assert not self.use_sequence_parallel, (
+                 "Currently, SP is not supported with PP"
+             )
++            relay_topk = {}
++            if self.topk_relay_out:  # local-cmp170hx-dsv32-topk-pp-relay
++                # A copy, not a view: the next step's indexer rewrites the
++                # buffer while this hop may still be in flight.
++                relay_topk["topk_indices"] = self.topk_indices_buffer[
++                    : hidden_states.shape[0]
++                ].clone()
+             return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
++                {
++                    "hidden_states": hidden_states,
++                    "residual": residual,
++                    **self.pack_local_aux_hidden_states(aux_hidden_states),
++                    **relay_topk,
++                }
+             )
+ 
+         if self.use_sequence_parallel:
+@@ -319,6 +391,7 @@ class DeepseekV32Model(torch.nn.Module):
+             hidden_states, _ = fused_allreduce_rms_norm(
+                 hidden_states, residual, self.norm
+             )
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+@@ -437,6 +510,11 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
+         if self.config.model_type == "glm_moe_dsa":
+             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
+ 
++    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        # The inherited DeepseekV2 setter assigns the tuple directly and
++        # skips the per-rank PP slot layout the aux relay depends on.
++        self.model._set_aux_hidden_state_layers(tuple(layers))
++
+     def set_moe_parameters(self):
+         # Same as the base, but keyed on the MoE block type rather than the
+         # decoder-layer type (DeepseekV32DecoderLayer is a plain nn.Module).
+diff --git a/vllm/v1/attention/backends/mla/triton_mla_sparse.py b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+index a09bbf972..49d644d7d 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+@@ -36,6 +36,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
+     flat_kv_row_view,
+     triton_convert_req_index_to_global_index,
+ )
++from vllm._glm52_mla_fp8 import triton_mla_sparse_attention_fp8
+ from vllm.v1.attention.ops.triton_mla_sparse import triton_mla_sparse_fwd
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+@@ -48,6 +49,9 @@ class TritonMLASparseBackend(AttentionBackend):
+         "auto",
+         "float16",
+         "bfloat16",
++        "fp8_ds_mla",  # local-cmp170hx-fp8-ds-mla
++        "fp8",
++        "fp8_e4m3",
+     ]
+ 
+     @staticmethod
+@@ -100,8 +104,11 @@ class TritonMLASparseBackend(AttentionBackend):
+         use_mm_prefix: bool,
+         device_capability: DeviceCapability,
+     ) -> str | None:
+-        if kv_cache_dtype not in (None, "auto", "float16", "bfloat16"):
+-            return "Triton MLA Sparse currently supports only FP16/BF16 KV cache"
++        if kv_cache_dtype not in (
++            None, "auto", "float16", "bfloat16",
++            "fp8", "fp8_e4m3", "fp8_ds_mla",
++        ):
++            return "Triton MLA Sparse supports FP16/BF16 and packed FP8 KV cache"
+ 
+         from vllm.config import get_current_vllm_config_or_none
+ 
+@@ -173,9 +180,9 @@ class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
+                 "TritonMLASparseImpl does not support alibi, sliding window, "
+                 "or logits soft cap."
+             )
+-        if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
++        if kv_cache_dtype not in ("auto", "float16", "bfloat16", "fp8_ds_mla"):
+             raise NotImplementedError(
+-                "TritonMLASparseImpl currently supports only FP16/BF16 KV cache."
++                "TritonMLASparseImpl supports FP16/BF16 and packed FP8 KV cache."
+             )
+ 
+         super().__init__(
+@@ -335,6 +342,19 @@ class TritonMLASparseImpl(SparseMLACommonImpl[TritonMLASparseMetadata]):
+             kv_cache if cache_is_flat else flat_kv_row_view(kv_cache, block_size)[0]
+         )
+         num_tokens = q.shape[0]
++        if self.kv_cache_dtype == "fp8_ds_mla":
++            # The cache is an opaque 656-byte row. The validated sm_80
++            # reader reconstructs e4m3 values from uint8 and never names
++            # an fp8 Triton type, which Ampere cannot compile. DCP is
++            # rejected by this backend, so no decode LSE is required.
++            assert kv_rows.dtype == torch.uint8 and kv_rows.shape[-1] == 656
++            out = triton_mla_sparse_attention_fp8(
++                q,
++                kv_rows,
++                topk_indices.view(num_tokens, 1, -1),
++                sm_scale=self.scale,
++            )
++            return out, None
+         out, _, lse = triton_mla_sparse_fwd(
+             q,
+             kv_rows.unsqueeze(1),
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 2d756035e..a1ffa8cb6 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1581,6 +1581,150 @@ def _glm5_next_draft_groups(
+     return groups
+ 
+ 
++# local-cmp170hx-dsa-dflash-kv: DSA target (MLA + indexer, packed fp8_ds_mla 656-byte rows)
++# plus a DFlash drafter's sliding-window layers. No mamba, so the glm5next
++# layout does not apply, and its exact-fit geometry is impossible here: a
++# 656-byte row gives MLA pages of 41 * 1024 * k bytes, which no 64-multiple
++# BF16 drafter block can match. Instead each drafter layer co-owns one MLA
++# tensor at disjoint block ids with its (smaller) page padded to the MLA
++# page, so the pool's per-block cost is unchanged and the drafter's sliding
++# window bounds it to a few block ids per request. The drafter block is used
++# as the kernel block (a multiple of 16, never split), which keeps the
++# padded strided view valid. Without this the generic fallback allocates
++# every drafter layer full-length (6 x 4 KiB/token), capping KV at ~0.96M.
++def _dsa_dflash_split(
++    kv_cache_spec: dict[str, KVCacheSpec],
++) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]] | None:
++    draft_specs = {
++        name: spec
++        for name, spec in kv_cache_spec.items()
++        if type(spec) is SlidingWindowSpec
++    }
++    attn_specs = {
++        name: spec
++        for name, spec in kv_cache_spec.items()
++        if type(spec) is not SlidingWindowSpec
++    }
++    if not draft_specs or not attn_specs:
++        return None
++    if not all(
++        type(spec) is MLAAttentionSpec and spec.page_size_padded is None
++        for spec in attn_specs.values()
++    ):
++        return None
++    return attn_specs, draft_specs
++
++
++def _get_kv_cache_groups_dsa_dflash(
++    vllm_config: VllmConfig,
++    kv_cache_spec: dict[str, KVCacheSpec],
++) -> list[KVCacheGroupSpec] | None:
++    split = _dsa_dflash_split(kv_cache_spec)
++    if split is None:
++        return None
++    attn_specs, draft_specs = split
++    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
++    if uniform_spec is None:
++        return None
++    mla_page = max(spec.page_size_bytes for spec in attn_specs.values())
++    mla_names = [
++        name for name, spec in attn_specs.items() if spec.page_size_bytes == mla_page
++    ]
++    mla_block = attn_specs[mla_names[0]].block_size
++    any_draft = next(iter(draft_specs.values()))
++    if not all(spec == any_draft for spec in draft_specs.values()):
++        logger.warning("DSA DFlash KV: drafter layers differ; shared layout not used")
++        return None
++    bytes_per_token = any_draft.page_size_bytes // any_draft.block_size
++    draft_block = (mla_page // bytes_per_token) // 16 * 16
++    while draft_block >= 16 and mla_block % draft_block:
++        draft_block -= 16
++    if draft_block < 16:
++        logger.warning(
++            "DSA DFlash KV: a %d B/token drafter block of >= 16 tokens does not "
++            "fit the %d B MLA page (block %d); use --block-size 128. The "
++            "drafter falls back to full-length KV (capacity drops).",
++            bytes_per_token,
++            mla_page,
++            mla_block,
++        )
++        return None
++    slots = _glm5_next_draft_mla_slots(vllm_config, mla_names)
++    if slots == 0:
++        logger.warning("DSA DFlash KV: no MLA layer on the drafter's stage")
++        return None
++    names = list(draft_specs)
++    num_groups = cdiv(len(names), slots)
++    per_group = cdiv(len(names), num_groups)
++    chunks = [names[i : i + per_group] for i in range(0, len(names), per_group)]
++    draft_groups: list[KVCacheGroupSpec] = []
++    for chunk in chunks:
++        fitted: dict[str, KVCacheSpec] = {
++            name: replace(
++                draft_specs[name], block_size=draft_block, page_size_padded=mla_page
++            )
++            for name in chunk
++        }
++        assert all(spec.page_size_bytes == mla_page for spec in fitted.values())
++        draft_uniform = UniformTypeKVCacheSpecs.from_specs(fitted)
++        if draft_uniform is None:
++            return None
++        draft_groups.append(KVCacheGroupSpec(list(fitted), draft_uniform))
++    spec_config = vllm_config.speculative_config
++    if spec_config is not None and spec_config.use_eagle_block_drop():
++        for group in draft_groups:
++            group.is_eagle_group = True
++    logger.info(
++        "DSA DFlash KV: %d drafter layers ride the MLA tensors in %d group(s) "
++        "of %s (drafter block %d, %d of %d B used per padded page, %d MLA "
++        "tensor(s) on the drafter's stage, no extra bytes per block)",
++        len(names),
++        len(chunks),
++        [len(c) for c in chunks],
++        draft_block,
++        draft_block * bytes_per_token,
++        mla_page,
++        slots,
++    )
++    return [KVCacheGroupSpec(list(attn_specs), uniform_spec)] + draft_groups
++
++
++def _dsa_dflash_tensor_layout(
++    kv_cache_groups: list[KVCacheGroupSpec],
++) -> tuple[KVCacheGroupSpec, list[KVCacheGroupSpec], list[str], list[str], int] | None:
++    """Recognize the DSA+DFlash grouping above, after optional PP projection."""
++    if len(kv_cache_groups) < 2 or not all(
++        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
++        for group in kv_cache_groups
++    ):
++        return None
++    attn_group = kv_cache_groups[0]
++    attn_inner = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec).kv_cache_specs
++    if not all(
++        type(spec) is MLAAttentionSpec and spec.page_size_padded is None
++        for spec in attn_inner.values()
++    ):
++        return None
++    mla_page = max(spec.page_size_bytes for spec in attn_inner.values())
++    mla_names = [
++        name
++        for name in attn_group.layer_names
++        if attn_inner[name].page_size_bytes == mla_page
++    ]
++    idx_names = [name for name in attn_group.layer_names if name not in mla_names]
++    draft_groups = kv_cache_groups[1:]
++    for group in draft_groups:
++        inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
++        if not inner or not all(
++            type(spec) is SlidingWindowSpec and spec.page_size_padded == mla_page
++            for spec in inner.values()
++        ):
++            return None
++        if len(group.layer_names) > len(mla_names):
++            return None
++    return attn_group, draft_groups, mla_names, idx_names, mla_page
++
++
+ def _glm5_next_tensor_layout(
+     kv_cache_groups: list[KVCacheGroupSpec],
+ ) -> (
+@@ -1919,6 +2063,13 @@ def _get_kv_cache_bytes_per_block(
+     kv_cache_groups: list[KVCacheGroupSpec],
+ ) -> int:
+     """Return the largest cache group's bytes per block."""
++    if (dsa_layout := _dsa_dflash_tensor_layout(kv_cache_groups)) is not None:
++        # Drafter layers ride the MLA tensors: no extra bytes per block.
++        attn_group = dsa_layout[0]
++        return sum(
++            _get_per_layer_spec(attn_group, name).page_size_bytes
++            for name in attn_group.layer_names
++        )
+     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+         # An exact-fit drafter group rides the MLA tensors, so it adds no
+         # bytes to the per-block cost.
+@@ -2092,6 +2243,51 @@ def get_kv_cache_config_from_groups(
+             ),
+         )
+ 
++    if (dsa_layout := _dsa_dflash_tensor_layout(kv_cache_groups)) is not None:
++        attn_group, draft_groups, mla_names, idx_names, mla_page = dsa_layout
++        attn_specs = cast(
++            UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
++        ).kv_cache_specs
++        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
++        num_blocks = may_override_num_blocks(
++            vllm_config, available_memory // bytes_per_block
++        )
++        size = bytes_per_block * num_blocks
++        dsa_tensors: list[KVCacheTensor] = []
++
++        def _add(layer_name: str, page: int, offset: int) -> None:
++            dsa_tensors.append(
++                KVCacheTensor(
++                    size=size,
++                    layers=[layer_name],
++                    layer_stride=page * num_blocks,
++                    block_stride=page,
++                    offset=offset,
++                )
++            )
++
++        offset = 0
++        for index, mla_name in enumerate(mla_names):
++            _add(mla_name, mla_page, offset)
++            for draft_group in draft_groups:
++                if index < len(draft_group.layer_names):
++                    # Drafter layer i co-owns MLA tensor i at disjoint
++                    # block ids (its page is padded to the MLA page).
++                    _add(draft_group.layer_names[index], mla_page, offset)
++            offset += mla_page * num_blocks
++        for idx_name in idx_names:
++            page = attn_specs[idx_name].page_size_bytes
++            _add(idx_name, page, offset)
++            offset += page * num_blocks
++        return KVCacheConfig(
++            num_blocks=num_blocks,
++            kv_cache_tensors=dsa_tensors,
++            kv_cache_groups=kv_cache_groups,
++            prefix_cache_retention_interval=(
++                vllm_config.cache_config.prefix_cache_retention_interval
++            ),
++        )
++
+     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+     validate_kv_cache_layout(layout, kv_cache_groups)
+     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+@@ -2661,6 +2857,8 @@ def get_kv_cache_groups(
+     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+         _warn_if_unannotated_eagle_mamba(vllm_config, glm5_groups)
+         return glm5_groups
++    elif dsa_groups := _get_kv_cache_groups_dsa_dflash(vllm_config, kv_cache_spec):
++        return dsa_groups
+ 
+     # Hidden-state layers use their own block table and must not be absorbed
+     # into a compatible attention bucket.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1bab67a96..4ecb2c2fb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -455,6 +455,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     mark_drafter_aux_fc_folded(self.speculator)
+             if self.draft_tail is not None:
+                 self.draft_tail.load(self.model, self.dtype)
++            # local-cmp170hx-lmhead-quant: the drafter aliases this lm_head.
++            from vllm._glm52_lmhead_quant import maybe_quantize_lm_head
++
++            maybe_quantize_lm_head(self.model)
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory

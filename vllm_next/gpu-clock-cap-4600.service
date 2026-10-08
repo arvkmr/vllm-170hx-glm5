@@ -1,0 +1,21 @@
+[Unit]
+Description=Cap SM clock of the marginal CMP 170HX at PCI 0000:46:00.0 (silent zero-row faults above ~1.3 GHz)
+Wants=nvidia-persistenced.service
+After=nvidia-persistenced.service
+
+# 2026-09-28: this card intermittently computed all-zero MoE output rows (and
+# garbage top-k indices) at its default ~1.49 GHz under vLLM's Marlin/Triton
+# kernels, surfacing as stray "!"/digit tokens. The fault followed the card
+# across a device swap; at 1300 MHz it was clean for 26,700 decode steps.
+# See VLLM_028_MIGRATION_HANDOFF.md. Remove this unit only after the card is
+# replaced or re-validated with vllm_next/probe_bang.py.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/sbin/modprobe nvidia
+ExecStart=/usr/bin/nvidia-smi -i 00000000:46:00.0 -lgc 210,1300
+ExecStop=/usr/bin/nvidia-smi -i 00000000:46:00.0 -rgc
+
+[Install]
+WantedBy=multi-user.target

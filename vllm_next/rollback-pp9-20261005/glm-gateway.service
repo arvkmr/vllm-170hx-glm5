@@ -1,0 +1,44 @@
+# /etc/systemd/system/glm-gateway.service
+[Unit]
+Description=GLM-5.3 client gateway (auth + fixed 512K x1 / 256K x2 context windows)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=arveen
+Environment=KEYS_FILE=/home/arveen/.config/glm-gateway/keys.json
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=8100
+Environment=UPSTREAM_URL=http://127.0.0.1:8002
+Environment=MODELS=glm-5.3-512k:524288:1,glm-5.3-256k:262144:2
+# Full request bodies (prompts) for these key names; tail with
+#   glm_gateway.py tail -f
+Environment=REQUEST_LOG_CLIENTS=client1
+Environment=REQUEST_LOG_FILE=/run/glm-gateway/requests.jsonl
+# RAM only (tmpfs), to spare the SSD: lost on reboot. tmpfs pages count
+# against MemoryMax, so 128 MiB x 4 = 512 MiB.
+Environment=REQUEST_LOG_MAX_BYTES=134217728
+Environment=REQUEST_LOG_BACKUPS=3
+# Creates /run/glm-gateway owned by User=, writable despite
+# ProtectSystem=strict, kept across service restarts until reboot.
+# 0700: it holds the client's prompts.
+RuntimeDirectory=glm-gateway
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/home/arveen/vllm_glm53_dflash2/venv/bin/python /home/arveen/glm-gateway/glm_gateway.py serve
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

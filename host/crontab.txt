@@ -1,0 +1,3 @@
+* * * * * /home/arveen/vllm_install/vllm_next/glm-watchdog.sh
+* * * * * /home/arveen/vllm_install/vllm_next/server-alert.py
+* * * * * /usr/bin/flock -n /dev/shm/gpu-power-log.lock /home/arveen/gpu-power-log/gpu_power_log.py >>/home/arveen/gpu-power-log/daemon.log 2>&1

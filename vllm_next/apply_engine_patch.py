@@ -993,104 +993,6 @@ def patch_dsv32_aux_over_pp(model: str) -> str:
     return model
 
 
-TOPK_RELAY_MARKER = "local-cmp170hx-dsv32-topk-pp-relay"
-
-
-def patch_dsv32_topk_pp_relay(model: str) -> str:
-    """Relay the top-k selections across a PP boundary that splits a skip-topk run.
-
-    Applied after ``patch_dsv32_aux_over_pp``. Needed for PP=8 and PP=9, whose
-    78-layer partitions cannot all start on index-producing layers.
-    """
-    model = replace_once(
-        model,
-        "class DeepseekV32Model(torch.nn.Module, EagleModelMixin):\n",
-        "def _dsa_layer_skips_topk(config, layer_id: int) -> bool:\n"
-        '    """Mirror of DeepseekV32Attention\'s skip-topk rule for a target layer."""\n'
-        '    freq = getattr(config, "index_topk_freq", 1)\n'
-        '    pattern = getattr(config, "index_topk_pattern", None)\n'
-        '    offset = getattr(config, "index_skip_topk_offset", 2)\n'
-        "    if pattern is None:\n"
-        "        return max(layer_id - offset + 1, 0) % freq != 0\n"
-        "    if 0 <= layer_id < len(pattern):\n"
-        '        return pattern[layer_id] == "S"\n'
-        "    return False\n\n\n"
-        "class DeepseekV32Model(torch.nn.Module, EagleModelMixin):\n",
-        "skip-topk rule helper",
-    )
-    model = replace_once(
-        model,
-        "        )\n\n"
-        "        self.aux_hidden_state_layers = tuple[int, ...]()\n",
-        "        )\n"
-        f"        # {TOPK_RELAY_MARKER}: a skip-topk layer reads the selections of\n"
-        "        # the most recent index-producing layer from the rank-local\n"
-        "        # topk_indices_buffer. When a stage boundary falls inside such a run\n"
-        "        # (e.g. PP=9 on 78 layers), the upstream stage sends its buffer along\n"
-        "        # with the hidden state and this stage restores it before its first\n"
-        "        # layer. The indices are logical (per-request token positions), so\n"
-        "        # they mean the same on every rank; each rank converts them to\n"
-        "        # physical slots with its own block table.\n"
-        "        pp_group = get_pp_group()\n"
-        "        self.topk_relay_in = not pp_group.is_first_rank and _dsa_layer_skips_topk(\n"
-        "            config, self.start_layer\n"
-        "        )\n"
-        "        self.topk_relay_out = not pp_group.is_last_rank and _dsa_layer_skips_topk(\n"
-        "            config, self.end_layer\n"
-        "        )\n"
-        "        if self.topk_relay_in:\n"
-        "            make_empty_base = self.make_empty_intermediate_tensors\n"
-        "            topk_width = config.index_topk\n\n"
-        "            def make_empty_with_topk(batch_size, dtype, device):\n"
-        "                tensors = make_empty_base(batch_size, dtype, device)\n"
-        '                tensors["topk_indices"] = torch.full(\n'
-        "                    (batch_size, topk_width), -1, dtype=torch.int32, device=device\n"
-        "                )\n"
-        "                return tensors\n\n"
-        "            self.make_empty_intermediate_tensors = make_empty_with_topk\n\n"
-        "        self.aux_hidden_state_layers = tuple[int, ...]()\n",
-        "decide relay direction per stage",
-    )
-    model = replace_once(
-        model,
-        '            residual = intermediate_tensors["residual"]\n\n'
-        "        full_num_tokens = positions.shape[0]\n",
-        '            residual = intermediate_tensors["residual"]\n'
-        f"            if self.topk_relay_in:  # {TOPK_RELAY_MARKER}\n"
-        '                relayed_topk = intermediate_tensors["topk_indices"]\n'
-        "                self.topk_indices_buffer[: relayed_topk.shape[0]].copy_(relayed_topk)\n\n"
-        "        full_num_tokens = positions.shape[0]\n",
-        "seed the buffer from upstream",
-    )
-    model = replace_once(
-        model,
-        "            return IntermediateTensors(\n"
-        "                {\n"
-        '                    "hidden_states": hidden_states,\n'
-        '                    "residual": residual,\n'
-        "                    **self.pack_local_aux_hidden_states(aux_hidden_states),\n"
-        "                }\n"
-        "            )\n",
-        "            relay_topk = {}\n"
-        f"            if self.topk_relay_out:  # {TOPK_RELAY_MARKER}\n"
-        "                # A copy, not a view: the next step's indexer rewrites the\n"
-        "                # buffer while this hop may still be in flight.\n"
-        '                relay_topk["topk_indices"] = self.topk_indices_buffer[\n'
-        "                    : hidden_states.shape[0]\n"
-        "                ].clone()\n"
-        "            return IntermediateTensors(\n"
-        "                {\n"
-        '                    "hidden_states": hidden_states,\n'
-        '                    "residual": residual,\n'
-        "                    **self.pack_local_aux_hidden_states(aux_hidden_states),\n"
-        "                    **relay_topk,\n"
-        "                }\n"
-        "            )\n",
-        "send the buffer downstream",
-    )
-    return model
-
-
 def git_head(source: Path) -> str:
     return subprocess.check_output(
         ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
@@ -1199,11 +1101,7 @@ def patch_source(source: Path, helper: Path, *, check: bool) -> None:
     )
 
     mla = patch_mla_head_bmm(mla)
-    dsv32 = dsv32_path.read_text()
-    # The relay rewrites the aux patch's IntermediateTensors anchor, so a
-    # relay-patched file must not go through the aux patch again.
-    if TOPK_RELAY_MARKER not in dsv32:
-        dsv32 = patch_dsv32_topk_pp_relay(patch_dsv32_aux_over_pp(dsv32))
+    dsv32 = patch_dsv32_aux_over_pp(dsv32_path.read_text())
     kernels = patch_dsv32_sm80_fp8(kernels_path.read_text())
     indexer = patch_indexer_sm80(indexer_path.read_text())
     topk = patch_topk_canon_decode(topk_path.read_text())

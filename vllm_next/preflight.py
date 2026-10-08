@@ -153,7 +153,7 @@ def validate_engine(source: Path) -> None:
         "MLA per-head decode bmm patch missing; rerun install.sh",
     )
     installed_helper = source / "vllm/_glm52_mla_fp8.py"
-    project_helper = Path(__file__).resolve().parent / "glm52_mla_fp8.py"
+    project_helper = Path(__file__).resolve().parent.parent / "glm52_mla_fp8.py"
     require(installed_helper.is_file(), "packed-fp8 reader is missing from the engine")
     require(
         hashlib.sha256(installed_helper.read_bytes()).digest()

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PROJECT="$HERE"
+PROJECT=$(cd "$HERE/.." && pwd)
 # shellcheck source=versions.env
 source "$HERE/versions.env"
 
