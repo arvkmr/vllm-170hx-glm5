@@ -218,7 +218,7 @@ LM head: silent corruption, not a model choice.
 
 ## Faulty GPUs
 
-CMP 170HX cards have no ECC. One card was found to compute all-zero MoE output
+One card was found to compute all-zero MoE output
 rows (about 1 per 3,000 decode steps) and occasional garbage top-k indices at
 its default clock under these kernels, while passing plain GEMM and memory
 tests (`gpu_consistency.py`). To find such a card:
