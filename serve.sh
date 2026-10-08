@@ -15,7 +15,7 @@ export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
 # Pipeline depth: PP_SIZE=8, 9 or 10 (default 8, current production).
 #   10  all ten cards, every stage starts on an index-producing layer.
 #   9   one card short (since 2026-10-03, serial 1322421041986 pulled).
-#   8   GPU 6 (83:00.0) left out for other work (since 2026-10-05).
+#   8   eight cards (since 2026-10-05).
 # 9 and 8 need the engine's top-k PP relay (local-cmp170hx-dsv32-topk-pp-relay,
 # applied by install.sh); preflight refuses their partitions without it.
 # Any other PP_SIZE (e.g. PP_SIZE=5 TP_SIZE=2) needs VLLM_PP_LAYER_PARTITION.
@@ -26,11 +26,9 @@ export TP_SIZE=${TP_SIZE:-1}
 # Number devices in nvidia-smi (PCI bus) order so the indices below name the
 # same cards nvidia-smi does; CUDA's default order differs on this host.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-case "$PP_SIZE" in
-  8) DEFAULT_DEVICES=0,1,2,3,4,5,7,8 ;;
-  *) DEFAULT_DEVICES=$(seq -s, 0 $((PP_SIZE * TP_SIZE - 1))) ;;
-esac
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$DEFAULT_DEVICES}
+# Defaults to the first PP_SIZE x TP_SIZE cards; set CUDA_VISIBLE_DEVICES to
+# pick others (e.g. 0,1,2,3,4,5,7,8 to keep GPU 6 free).
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((PP_SIZE * TP_SIZE - 1)))}
 case "$PP_SIZE" in
   # 8 stages: ~5.0 GiB of weights per MoE layer, so the six 10-layer stages
   # (~50.2 GiB) bound the KV pool. Stage 0 carries the 3 dense layers and the

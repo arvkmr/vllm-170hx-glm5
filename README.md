@@ -163,13 +163,13 @@ PP_SIZE=10 ./start.sh         # pipeline depth: 8 (default), 9 or 10
 
 | `PP_SIZE` | GPUs (`nvidia-smi` index) | Partition | `GPU_UTIL` | KV pool (tokens) |
 |---|---|---|---|---|
-| 8 (default) | 0-5, 7, 8 | `11,10,10,10,10,10,9,8` | 0.96 | 1,025,573 |
+| 8 (default) | 0-7 | `11,10,10,10,10,10,9,8` | 0.96 | 1,025,573 |
 | 9 | 0-8 | `10,9,9,9,9,9,9,8,6` | 0.93 | 1,600,895 |
 | 10 | 0-9 | `10,8,8,8,8,8,8,8,8,4` | 0.93 | ~2.09M |
 
 - `serve.sh` sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the indices match
-  `nvidia-smi`. PP=8 leaves GPU 6 free. Pass `CUDA_VISIBLE_DEVICES` to choose
-  other cards.
+  `nvidia-smi`. Each size uses the first N cards. Pass
+  `CUDA_VISIBLE_DEVICES` to choose others (e.g. `0,1,2,3,4,5,7,8`).
 - PP=8 and PP=9 have stages that start on skip-topk layers. They need the
   top-k PP relay. Preflight checks for its marker and refuses those
   partitions without it.

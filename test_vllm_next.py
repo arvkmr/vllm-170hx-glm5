@@ -86,7 +86,7 @@ class VllmNextContracts(unittest.TestCase):
             return subprocess.run(["bash", "-c", script], env={**clean, **env},
                                   capture_output=True, text=True)
         self.assertEqual(run().stdout.split("|")[1:], ["11,10,10,10,10,10,9,8", "0.96\n"])
-        self.assertEqual(run(PP_SIZE="8").stdout.split("|")[0], "0,1,2,3,4,5,7,8")
+        self.assertEqual(run(PP_SIZE="8").stdout.split("|")[0], "0,1,2,3,4,5,6,7")
         self.assertEqual(run(PP_SIZE="9").stdout.split("|")[1], "10,9,9,9,9,9,9,8,6")
         self.assertEqual(run(PP_SIZE="10").stdout.split("|")[1:], ["10,8,8,8,8,8,8,8,8,4", "0.93\n"])
         self.assertNotEqual(run(PP_SIZE="7").returncode, 0)
